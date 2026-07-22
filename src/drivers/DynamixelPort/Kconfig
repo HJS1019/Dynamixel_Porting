@@ -1,0 +1,8 @@
+menuconfig DRIVERS_DYNAMIXEL
+	bool "dynamixel"
+	default n
+	---help---
+		Enable support for the Dynamixel Protocol 2.0 servo driver.
+		This initial version only supports basic Read/Write register
+		access (no daisy-chain scheduling, no half-duplex direction
+		control yet).
