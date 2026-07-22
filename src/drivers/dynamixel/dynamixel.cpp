@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <cstdlib>
-
+constexpr uint8_t Dynamixel::_servo_ids[4];
 Dynamixel::Dynamixel(const char *port, int baudrate) :
 	_baudrate(baudrate)
 {

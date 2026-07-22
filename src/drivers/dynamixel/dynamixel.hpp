@@ -6,7 +6,10 @@
 #include <px4_platform_common/tasks.h>
 #include <px4_platform_common/defines.h>
 #include <drivers/drv_hrt.h>
-
+#include <uORB/Subscription.hpp>
+#include <uORB/Publication.hpp>
+#include <uORB/topics/servo_command.h>
+#include <uORB/topics/servo_angle.h>
 #include <cstdint>
 #include <cstring>
 
