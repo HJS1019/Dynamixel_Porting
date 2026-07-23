@@ -102,17 +102,19 @@ bool Dynamixel::openSerial()
 
 	switch (_baudrate) {
 	case 9600:    speed = B9600;    break;
-	case 19200:   speed = B19200;   break;
 	case 57600:   speed = B57600;   break;
 	case 115200:  speed = B115200;  break;
-	case 230400:  speed = B230400;  break;
 	case 1000000: speed = B1000000; break;
-
+	case 2000000: speed = B2000000; break;
+	case 3000000: speed = B3000000; break;
+	case 4000000: speed = B4000000; break;
+	// 주의: 4,500,000은 표준 termios 매크로(B4500000)가 없어서
+	//       플랫폼별(NuttX/Linux) 커스텀 보드레이트 설정이 필요함
 	default:
-		PX4_ERR("unsupported baudrate %d", _baudrate);
-		closeSerial();
-		return false;
-	}
+    	 PX4_ERR("unsupported baudrate %d", _baudrate);
+    	 closeSerial();
+    	 return false;
+}
 
 	cfsetispeed(&uart_config, speed);
 	cfsetospeed(&uart_config, speed);
