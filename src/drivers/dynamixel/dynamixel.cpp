@@ -24,6 +24,15 @@ bool Dynamixel::init()
 	}
 
 	for (uint8_t id : _servo_ids) {
+		// [추가] 토크를 켜기 전에 ping으로 서보가 실제로 응답하는지 확인한다.
+		//        배선/ID/보드레이트가 틀렸을 때 조용히 넘어가지 않고 로그로 알려준다.
+		if (ping(id)) {
+			PX4_INFO("dynamixel: id=%u found (ping OK)", id);
+
+		} else {
+			PX4_WARN("dynamixel: id=%u no response (ping FAIL) - 배선/ID/baud 확인", id);
+		}
+
 		if (!enableTorque(id, true)) {
 			PX4_WARN("dynamixel: failed to enable torque for id=%u", id);
 		}
@@ -37,6 +46,8 @@ bool Dynamixel::enableTorque(uint8_t id, bool enable)
 	return writeRegister(id, ADDR_TORQUE_ENABLE, enable ? 1 : 0, 1);
 }
 
+
+//서보모터 각도값을 Dynamixel의 Position값으로 변환하는 함수
 uint32_t Dynamixel::angleToPosition(float angle_rad) const
 {
 	float clamped = angle_rad;
@@ -49,6 +60,7 @@ uint32_t Dynamixel::angleToPosition(float angle_rad) const
 	return DXL_POS_MIN + (uint32_t)(ratio * (DXL_POS_MAX - DXL_POS_MIN));
 }
 
+//Dynamixel의 Position값을 서보모터 각도값으로 변환하는 함수
 float Dynamixel::positionToAngle(uint32_t position) const
 {
 	const float ratio = float(position - DXL_POS_MIN) / float(DXL_POS_MAX - DXL_POS_MIN); // 0~1
@@ -215,6 +227,11 @@ uint16_t Dynamixel::updateCRC(uint16_t crc_accum, const uint8_t *data, uint16_t 
 
 // packet[PKT_LEN_L]/[PKT_LEN_H]에 "Instruction(1)+Params+CRC(2)" 길이가
 // 이미 채워져 있다고 가정. 헤더/CRC를 채우고 전송한다.
+//
+// [주의] 바이트 스터핑(byte stuffing) 미구현:
+//   Protocol 2.0은 파라미터 안에 0xFF 0xFF 0xFD 패턴이 나오면 0xFD를 끼워넣어야 한다.
+//   현재 용도(위치값 0~4095, 주소/길이 소값)에서는 이 패턴이 나올 수 없어 안전하지만,
+//   확장위치/멀티턴 등 큰 값을 다루게 되면 여기서 스터핑을 추가해야 한다.
 int Dynamixel::txPacket(uint8_t *packet)
 {
 	const uint16_t len = packet[PKT_LEN_L] | (packet[PKT_LEN_H] << 8);
@@ -229,61 +246,110 @@ int Dynamixel::txPacket(uint8_t *packet)
 	packet[total_len - 2] = crc & 0xFF;
 	packet[total_len - 1] = (crc >> 8) & 0xFF;
 
-	return serialWrite(packet, total_len);
+	const int written = serialWrite(packet, total_len);
+
+	// [추가] TX 버퍼가 실제 회선으로 다 나갈 때까지 대기.
+	//   - O_NONBLOCK이라 write는 큐잉만 하고 곧바로 리턴하므로,
+	//     전송이 끝나기도 전에 읽기를 시작하는 것을 막는다.
+	//   - half-duplex에서는 "송신 완료 → 수신 전환"의 기준점이 되고,
+	//     full-duplex(단선 결선)에서는 우리가 보낸 바이트의 에코보다
+	//     먼저 읽기 시작하는 것을 막아준다.
+	if (_uart_fd >= 0) {
+		tcdrain(_uart_fd);
+	}
+
+	return written;
 }
 
 // Status packet(0x55) 수신 및 검증
+//
+// [변경 요약]
+//   기존: 수신 버퍼의 앞 7바이트를 무조건 status 헤더로 간주 → 어긋나면 그대로 실패.
+//   변경: (1) 0xFF 0xFF 0xFD 헤더를 바이트 단위로 재동기화하고,
+//         (2) 한 패킷을 파싱한 뒤 그것이 우리가 기다리는 Status(0x55)가 아니면
+//             (대표적으로 우리가 방금 보낸 패킷의 half-duplex 에코) 버리고 다음 패킷을 찾는다.
+//   → 단선(반이중) 결선에서 에코가 섞여 들어와도 진짜 status 패킷을 찾아낸다.
 bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t expected_param_len, int timeout_ms)
 {
-	uint8_t buf[MAX_PACKET_LEN] {};
+	const hrt_abstime start = hrt_absolute_time();
 
-	// 헤더(3)+예약(1)+ID(1)+LEN_L+LEN_H = 7바이트 먼저 확보
-	if (serialRead(buf, PKT_INST, timeout_ms) < PKT_INST) {
-		return false;
+	while ((int)(hrt_elapsed_time(&start) / 1000) < timeout_ms) {
+
+		uint8_t buf[MAX_PACKET_LEN] {};
+
+		// 1) 헤더 0xFF 0xFF 0xFD 동기화 (한 바이트씩 밀어 넣으며 패턴 탐색)
+		int matched = 0;
+
+		while (matched < 3) {
+			uint8_t b = 0;
+
+			if (serialRead(&b, 1, timeout_ms) < 1) {
+				return false; // timeout: 더 들어오는 바이트 없음
+			}
+
+			if (matched == 0 && b == DXL_HEADER0) { matched = 1; }
+
+			else if (matched == 1 && b == DXL_HEADER1) { matched = 2; }
+
+			else if (matched == 2 && b == DXL_HEADER2) { matched = 3; }
+
+			else if (b == DXL_HEADER0) { matched = 1; } // 어긋나면 부분 재시작
+
+			else { matched = 0; }
+		}
+
+		buf[PKT_HEADER0] = DXL_HEADER0;
+		buf[PKT_HEADER1] = DXL_HEADER1;
+		buf[PKT_HEADER2] = DXL_HEADER2;
+
+		// 2) reserved + id + len_l + len_h (4바이트)
+		if (serialRead(&buf[PKT_RESERVED], 4, timeout_ms) < 4) {
+			return false;
+		}
+
+		const uint16_t len = buf[PKT_LEN_L] | (buf[PKT_LEN_H] << 8); // INST(1)+ERROR(1)+PARAM+CRC(2)
+		const uint16_t total_len = PKT_INST + len;
+
+		if (len < 4 || total_len > MAX_PACKET_LEN) {
+			continue; // 비정상 길이 → 다음 패킷 탐색
+		}
+
+		// 3) 나머지 (instruction + error + param + crc) 수신
+		if (serialRead(&buf[PKT_INST], len, timeout_ms) < len) {
+			return false;
+		}
+
+		// 4) CRC 검증 (헤더 ~ 파라미터 전체)
+		const uint16_t crc_received = buf[total_len - 2] | (buf[total_len - 1] << 8);
+		const uint16_t crc_calc = updateCRC(0, buf, total_len - 2);
+
+		if (crc_received != crc_calc) {
+			continue; // 깨진 패킷/에코 잔재 → 다음 패킷 탐색
+		}
+
+		// 5) 우리가 기다리는 Status(0x55) + 해당 ID 인가?
+		//    아니라면(대표적으로 우리가 보낸 패킷의 에코) 버리고 계속 탐색.
+		if (buf[PKT_INST] != INST_STATUS || buf[PKT_ID] != expected_id) {
+			continue;
+		}
+
+		const uint8_t error = buf[PKT_INST + 1];
+
+		if (error != 0) {
+			PX4_WARN("dynamixel: id=%u returned error=0x%02X", expected_id, error);
+		}
+
+		const uint8_t param_len = (len >= 4) ? (len - 4) : 0; // len = inst+error+param+crc
+
+		if (param_out != nullptr && expected_param_len > 0) {
+			const uint8_t copy_len = (param_len < expected_param_len) ? param_len : expected_param_len;
+			memcpy(param_out, &buf[PKT_INST + 2], copy_len);
+		}
+
+		return (error == 0);
 	}
 
-	if (buf[PKT_HEADER0] != DXL_HEADER0 || buf[PKT_HEADER1] != DXL_HEADER1 ||
-	    buf[PKT_HEADER2] != DXL_HEADER2) {
-		return false;
-	}
-
-	const uint16_t len = buf[PKT_LEN_L] | (buf[PKT_LEN_H] << 8); // INST(1)+ERROR(1)+PARAM+CRC(2)
-	const uint16_t total_len = PKT_INST + len;
-
-	if (total_len > MAX_PACKET_LEN) {
-		return false;
-	}
-
-	if (serialRead(&buf[PKT_INST], len, timeout_ms) < len) {
-		return false;
-	}
-
-	const uint16_t crc_received = buf[total_len - 2] | (buf[total_len - 1] << 8);
-	const uint16_t crc_calc = updateCRC(0, buf, total_len - 2);
-
-	if (crc_received != crc_calc) {
-		PX4_WARN("dynamixel: CRC mismatch (id=%u)", expected_id);
-		return false;
-	}
-
-	if (buf[PKT_INST] != INST_STATUS || buf[PKT_ID] != expected_id) {
-		return false;
-	}
-
-	const uint8_t error = buf[PKT_INST + 1];
-
-	if (error != 0) {
-		PX4_WARN("dynamixel: id=%u returned error=0x%02X", expected_id, error);
-	}
-
-	const uint8_t param_len = (len >= 4) ? (len - 4) : 0; // len = inst+error+param+crc
-
-	if (param_out != nullptr && expected_param_len > 0) {
-		const uint8_t copy_len = (param_len < expected_param_len) ? param_len : expected_param_len;
-		memcpy(param_out, &buf[PKT_INST + 2], copy_len);
-	}
-
-	return (error == 0);
+	return false; // timeout 안에 원하는 status 패킷을 못 찾음
 }
 
 bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
@@ -340,6 +406,29 @@ bool Dynamixel::readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *da
 	txPacket(packet);
 
 	return rxStatusPacket(id, data_out, len, 20);
+}
+
+// [추가] Ping (INST_PING)
+//   status packet의 파라미터로 model number(2) + firmware version(1) = 3바이트가 온다.
+bool Dynamixel::ping(uint8_t id)
+{
+	if (_uart_fd < 0 || id == DXL_BROADCAST_ID) {
+		return false;
+	}
+
+	uint8_t packet[16] {};
+	packet[PKT_ID] = id;
+
+	const uint16_t inst_len = 1 + 0 + 2; // instruction + (no params) + crc
+	packet[PKT_LEN_L] = inst_len & 0xFF;
+	packet[PKT_LEN_H] = (inst_len >> 8) & 0xFF;
+
+	packet[PKT_INST] = INST_PING;
+
+	txPacket(packet);
+
+	uint8_t param[3] {};
+	return rxStatusPacket(id, param, 3, 50);
 }
 
 // ============================================================
@@ -450,7 +539,7 @@ void Dynamixel::run()
 			_servo_angle_pub.publish(angle_msg);
 		}
 
-		px4_usleep(20000); // 약 50Hz
+		px4_usleep(20000); // 약 50Hz (실제로는 왕복 지연 때문에 더 느려질 수 있음)
 	}
 
 	closeSerial();
@@ -506,6 +595,18 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		return ok ? 0 : 1;
 	}
 
+	// [추가] ping 커맨드: 브링업 때 서보가 잡히는지 바로 확인용
+	if (strcmp(argv[0], "ping") == 0) {
+		if (argc != 2) {
+			return print_usage("ping requires: <id>");
+		}
+
+		const uint8_t id = (uint8_t)atoi(argv[1]);
+		const bool ok = get_instance()->ping(id);
+		PX4_INFO("ping id=%u -> %s", id, ok ? "OK" : "FAIL");
+		return ok ? 0 : 1;
+	}
+
 	return print_usage("unknown command");
 }
 
@@ -526,6 +627,7 @@ Read/Write만 지원한다.
 
 ### Examples
 $ dynamixel start -d /dev/ttyS3 -b 57600
+$ dynamixel ping 1
 $ dynamixel write 1 116 1024 4
 $ dynamixel read 1 132 4
 $ dynamixel stop
@@ -536,6 +638,7 @@ $ dynamixel status
 	PRINT_MODULE_USAGE_COMMAND("start");
 	PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, "<file:dev>", "Serial device", false);
 	PRINT_MODULE_USAGE_PARAM_INT('b', 57600, 9600, 3000000, "Baudrate", true);
+	PRINT_MODULE_USAGE_COMMAND_DESCR("ping", "ping <id>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("write", "write <id> <addr> <value> <len>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("read", "read <id> <addr> <len>");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();

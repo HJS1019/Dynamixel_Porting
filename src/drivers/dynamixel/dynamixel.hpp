@@ -54,6 +54,14 @@ public:
 	 */
 	bool readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out);
 
+	/**
+	 * Dynamixel Protocol 2.0 ping (INST_PING)
+	 * 해당 id 서보가 살아 있는지(응답하는지) 확인한다.
+	 * @param id  servo id (broadcast는 지원 안 함)
+	 * @return    status packet을 정상 수신하면 true
+	 */
+	bool ping(uint8_t id);
+
 private:
 	// ---------------- Serial (raw POSIX termios) ----------------
 	// 통신 방식(half-duplex 전환 등)은 아직 고려하지 않음. 일반 풀듀플렉스 UART로만 open.
@@ -99,13 +107,18 @@ private:
 	static constexpr uint16_t ADDR_GOAL_POSITION   = 116;
 	static constexpr uint16_t ADDR_PRESENT_POSITION = 132;
 
-	// 이 프로젝트(Palletrone)는 틸트 서보 4개 구조로 보여, ID 1~4로 가정
+	// 다이나믹셀 서보 ID 1~4로 가정
 	// 실제 서보 ID 배선과 다르면 이 배열만 수정하면 됨
 	static constexpr uint8_t _servo_ids[4] = {1, 2, 3, 4};
 
-	// servo_command/servo_angle 단위를 라디안 ±90도로 가정 (프로젝트 규약 확인 필요)
-	static constexpr float SERVO_ANGLE_MIN_RAD = -1.570796f; // -90deg
-	static constexpr float SERVO_ANGLE_MAX_RAD =  1.570796f; //  90deg
+	// servo_command/servo_angle 단위를 라디안 0~360도로 가정.
+	// 서보 위치값 0~4095가 물리적으로 0~360도에 대응하므로 이 범위에 그대로 매핑한다.
+	// (angleToPosition/positionToAngle는 아래 MIN/MAX 상수만 보고 선형 변환하므로
+	//  변환 함수 코드 자체는 수정할 필요가 없다.)
+	// 주의: 이제 0 미만/2*pi 초과 각도는 0 또는 2*pi로 clamp된다. 명령을 보내는 쪽에서
+	//       0~2*pi(rad) 범위로 각도를 주는지 확인할 것.
+	static constexpr float SERVO_ANGLE_MIN_RAD = 0.0f;      //   0deg
+	static constexpr float SERVO_ANGLE_MAX_RAD = 6.283185f; // 360deg (2*pi)
 	static constexpr uint32_t DXL_POS_MIN = 0;
 	static constexpr uint32_t DXL_POS_MAX = 4095;
 
