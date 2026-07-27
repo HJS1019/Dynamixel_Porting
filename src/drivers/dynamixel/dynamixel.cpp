@@ -569,7 +569,7 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		const uint8_t  len   = (uint8_t)atoi(argv[4]);
 
 		const bool ok = get_instance()->writeRegister(id, addr, value, len);
-		PX4_INFO("write id=%u addr=%u value=%u len=%u -> %s", id, addr, value, len, ok ? "OK" : "FAIL");
+		PX4_INFO("write id=%u addr=%u value=%u len=%u -> %s", (unsigned)id, (unsigned)addr, (unsigned)value, (unsigned)len, ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;
 	}
 
@@ -588,11 +588,12 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		if (ok) {
 			uint32_t value = 0;
 			memcpy(&value, data, len > 4 ? 4 : len);
-			PX4_INFO("read id=%u addr=%u len=%u -> value=%u", id, addr, len, value);
+			PX4_INFO("read id=%u addr=%u len=%u -> value=%u", (unsigned)id, (unsigned)addr, (unsigned)len, (unsigned)value);
 
 		} else {
-			PX4_ERR("read id=%u addr=%u failed", id, addr);
+			PX4_ERR("read id=%u addr=%u failed", (unsigned)id, (unsigned)addr);
 		}
+
 
 		return ok ? 0 : 1;
 	}
@@ -605,7 +606,7 @@ int Dynamixel::custom_command(int argc, char *argv[])
 
 		const uint8_t id = (uint8_t)atoi(argv[1]);
 		const bool ok = get_instance()->ping(id);
-		PX4_INFO("ping id=%u -> %s", id, ok ? "OK" : "FAIL");
+		PX4_INFO("ping id=%u -> %s", (unsigned)id, ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;
 	}
 
