@@ -301,13 +301,17 @@ bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t 
 
 		// 1) 헤더 0xFF 0xFF 0xFD 동기화 (한 바이트씩 밀어 넣으며 패턴 탐색)
 		int matched = 0;
+		int dbg_cnt = 0;
 
 		while (matched < 3) {
 			uint8_t b = 0;
 
 			if (serialRead(&b, 1, timeout_ms) < 1) {
+				PX4_WARN("dxl : rx timeout, dbg_cnt=%d",dbg_cnt);
 				return false; // timeout: 더 들어오는 바이트 없음
 			}
+
+			PX4_INFO("dxl : rx[%d]=0x%02X", dbg_cnt++, b);
 
 			if (matched == 0 && b == DXL_HEADER0) { matched = 1; }
 
@@ -449,9 +453,10 @@ bool Dynamixel::ping(uint8_t id)
 
 	txPacket(packet);
 
-	// ===== DEBUG: 수신 원본 바이트 덤프 =====
+	px4_usleep(2000);   // [실험] 송신 완료 + 서보 응답 대기 2ms
+
 	uint8_t dbg[64] {};
-	int n = serialRead(dbg, sizeof(dbg), 50); // 50ms 동안 오는 바이트 수집
+	int n = serialRead(dbg, sizeof(dbg), 50);
 	PX4_INFO("PING id=%u: rx %d bytes", (unsigned)id, n);
 
 	for (int i = 0; i < n; i++) {
