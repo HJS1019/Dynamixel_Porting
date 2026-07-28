@@ -131,7 +131,14 @@ bool Dynamixel::openSerial()
 
 	tcflush(_uart_fd, TCIOFLUSH);
 	#ifdef TIOCSSINGLEWIRE
-	if (ioctl(_uart_fd, TIOCSSINGLEWIRE, SER_SINGLEWIRE_ENABLED) < 0) {
+
+	#ifdef SER_SINGLEWIRE_PULLUP
+	const unsigned long sw_arg = SER_SINGLEWIRE_ENABLED | SER_SINGLEWIRE_PULLUP;
+	#else
+	const unsigned long sw_arg = SER_SINGLEWIRE_ENABLED;
+	#endif
+
+	if (ioctl(_uart_fd, TIOCSSINGLEWIRE, sw_arg) < 0) {
 		PX4_WARN("dynamixel: single-wire 설정 실패 - NuttX defconfig 확인");
 	} else {
 		PX4_INFO("dynamixel: single-wire half-duplex 모드 활성화됨");
@@ -442,8 +449,16 @@ bool Dynamixel::ping(uint8_t id)
 
 	txPacket(packet);
 
-	uint8_t param[3] {};
-	return rxStatusPacket(id, param, 3, 50);
+	// ===== DEBUG: 수신 원본 바이트 덤프 =====
+	uint8_t dbg[64] {};
+	int n = serialRead(dbg, sizeof(dbg), 50); // 50ms 동안 오는 바이트 수집
+	PX4_INFO("PING id=%u: rx %d bytes", (unsigned)id, n);
+
+	for (int i = 0; i < n; i++) {
+		PX4_INFO("  [%d] 0x%02X", i, (unsigned)dbg[i]);
+	}
+
+	return (n > 0);
 }
 
 // ============================================================
