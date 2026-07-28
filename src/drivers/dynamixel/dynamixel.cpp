@@ -1,4 +1,8 @@
 #include "dynamixel.hpp"
+#include <sys/ioctl.h>
+#ifdef __PX4_NUTTX
+# include <nuttx/serial/tioctl.h>
+#endif
 
 #include <fcntl.h>
 #include <termios.h>
@@ -126,6 +130,15 @@ bool Dynamixel::openSerial()
 	}
 
 	tcflush(_uart_fd, TCIOFLUSH);
+	#ifdef TIOCSSINGLEWIRE
+	if (ioctl(_uart_fd, TIOCSSINGLEWIRE, SER_SINGLEWIRE_ENABLED) < 0) {
+		PX4_WARN("dynamixel: single-wire 설정 실패 - NuttX defconfig 확인");
+	} else {
+		PX4_INFO("dynamixel: single-wire half-duplex 모드 활성화됨");
+	}
+#else
+	PX4_INFO("dynamixel: single-wire 미지원 플랫폼 - full-duplex");
+#endif
 
 	PX4_INFO("opened %s @ %d baud", _port, _baudrate);
 	return true;
