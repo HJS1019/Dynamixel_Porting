@@ -1,47 +1,111 @@
 #include "dynamixel.hpp"
+
 #include <sys/ioctl.h>
 #ifdef __PX4_NUTTX
 # include <nuttx/serial/tioctl.h>
 #endif
 
+#include <cmath>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <termios.h>
 #include <unistd.h>
 #include <errno.h>
 #include <cstdlib>
-constexpr uint8_t Dynamixel::_servo_ids[4];
-Dynamixel::Dynamixel(const char *port, int baudrate) :
-	_baudrate(baudrate)
+
+namespace
+{
+
+bool parseUnsignedArgument(const char *text, uint32_t minimum, uint32_t maximum, uint32_t &value, int base = 10)
+{
+	if (text == nullptr || text[0] == '\0' || text[0] == '-') {
+		return false;
+	}
+
+	errno = 0;
+	char *end = nullptr;
+	const unsigned long long parsed = strtoull(text, &end, base);
+
+	if (errno == ERANGE || end == text || *end != '\0' || parsed < minimum || parsed > maximum) {
+		return false;
+	}
+
+	value = static_cast<uint32_t>(parsed);
+	return true;
+}
+
+class BusLock
+{
+public:
+	explicit BusLock(pthread_mutex_t &mutex) :
+		_mutex(mutex),
+		_locked(pthread_mutex_lock(&_mutex) == 0)
+	{
+	}
+
+	~BusLock()
+	{
+		if (_locked) {
+			pthread_mutex_unlock(&_mutex);
+		}
+	}
+
+	bool locked() const { return _locked; }
+
+private:
+	pthread_mutex_t &_mutex;
+	bool _locked;
+};
+
+} // namespace
+
+Dynamixel::Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode wire_mode,
+		     uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz) :
+	ModuleParams(nullptr),
+	_baudrate(baudrate),
+	_run_mode(run_mode),
+	_wire_mode(wire_mode),
+	_active_servo_count(active_servo_count)
 {
 	strncpy(_port, port, sizeof(_port) - 1);
+
+	for (unsigned i = 0; i < MAX_SERVOS; ++i) {
+		_servo_ids[i] = first_servo_id + i;
+	}
+
+	if (feedback_rate_hz > 0) {
+		_feedback_interval_us = 1000000 / feedback_rate_hz;
+	}
+
+	_mutex_initialized = (pthread_mutex_init(&_bus_mutex, nullptr) == 0);
 }
 
 Dynamixel::~Dynamixel()
 {
 	closeSerial();
+
+	if (_mutex_initialized) {
+		pthread_mutex_destroy(&_bus_mutex);
+	}
 }
 
 bool Dynamixel::init()
 {
-	if (!openSerial()) {
+	if (!_mutex_initialized) {
+		PX4_ERR("failed to initialize bus mutex");
 		return false;
 	}
 
-	for (uint8_t id : _servo_ids) {
-		// [추가] 토크를 켜기 전에 ping으로 서보가 실제로 응답하는지 확인한다.
-		//        배선/ID/보드레이트가 틀렸을 때 조용히 넘어가지 않고 로그로 알려준다.
-		if (ping(id)) {
-			PX4_INFO("dynamixel: id=%u found (ping OK)", id);
+	updateParams();
+	updateCalibration();
+	BusLock lock(_bus_mutex);
 
-		} else {
-			PX4_WARN("dynamixel: id=%u no response (ping FAIL) - 배선/ID/baud 확인", id);
-		}
-
-		if (!enableTorque(id, true)) {
-			PX4_WARN("dynamixel: failed to enable torque for id=%u", id);
-		}
+	if (!lock.locked() || !openSerial()) {
+		return false;
 	}
 
+	_connected_mask = 0;
+	PX4_INFO("bus idle; torque state unchanged (use explicit NSH commands)");
 	return true;
 }
 
@@ -51,25 +115,88 @@ bool Dynamixel::enableTorque(uint8_t id, bool enable)
 }
 
 
-//서보모터 각도값을 Dynamixel의 Position값으로 변환하는 함수
-uint32_t Dynamixel::angleToPosition(float angle_rad) const
+bool Dynamixel::angleToPosition(unsigned servo_index, float angle_rad, uint32_t &position) const
 {
-	float clamped = angle_rad;
+	if (servo_index >= MAX_SERVOS || !PX4_ISFINITE(angle_rad)) {
+		return false;
+	}
 
-	if (clamped < SERVO_ANGLE_MIN_RAD) { clamped = SERVO_ANGLE_MIN_RAD; }
-	if (clamped > SERVO_ANGLE_MAX_RAD) { clamped = SERVO_ANGLE_MAX_RAD; }
-
-	const float ratio = (clamped - SERVO_ANGLE_MIN_RAD) / (SERVO_ANGLE_MAX_RAD - SERVO_ANGLE_MIN_RAD); // 0~1
-
-	return DXL_POS_MIN + (uint32_t)(ratio * (DXL_POS_MAX - DXL_POS_MIN));
+	const DynamixelPositionMapping::Calibration calibration {
+		_zero_raw[servo_index],
+		_direction[servo_index],
+		_min_raw[servo_index],
+		_max_raw[servo_index]
+	};
+	return DynamixelPositionMapping::angleToPosition(calibration, angle_rad, position);
 }
 
-//Dynamixel의 Position값을 서보모터 각도값으로 변환하는 함수
-float Dynamixel::positionToAngle(uint32_t position) const
+float Dynamixel::positionToAngle(unsigned servo_index, uint32_t position) const
 {
-	const float ratio = float(position - DXL_POS_MIN) / float(DXL_POS_MAX - DXL_POS_MIN); // 0~1
+	if (servo_index >= MAX_SERVOS) {
+		return NAN;
+	}
 
-	return SERVO_ANGLE_MIN_RAD + ratio * (SERVO_ANGLE_MAX_RAD - SERVO_ANGLE_MIN_RAD);
+	const DynamixelPositionMapping::Calibration calibration {
+		_zero_raw[servo_index],
+		_direction[servo_index],
+		_min_raw[servo_index],
+		_max_raw[servo_index]
+	};
+	return DynamixelPositionMapping::positionToAngle(calibration, position);
+}
+
+void Dynamixel::updateCalibration()
+{
+	const int32_t requested_zero[MAX_SERVOS] {
+		_param_dxl_s1_zero.get(), _param_dxl_s2_zero.get(), _param_dxl_s3_zero.get(), _param_dxl_s4_zero.get()
+	};
+	const int32_t requested_direction[MAX_SERVOS] {
+		_param_dxl_s1_dir.get(), _param_dxl_s2_dir.get(), _param_dxl_s3_dir.get(), _param_dxl_s4_dir.get()
+	};
+	const int32_t requested_min[MAX_SERVOS] {
+		_param_dxl_s1_min.get(), _param_dxl_s2_min.get(), _param_dxl_s3_min.get(), _param_dxl_s4_min.get()
+	};
+	const int32_t requested_max[MAX_SERVOS] {
+		_param_dxl_s1_max.get(), _param_dxl_s2_max.get(), _param_dxl_s3_max.get(), _param_dxl_s4_max.get()
+	};
+	BusLock lock(_bus_mutex);
+
+	if (!lock.locked()) {
+		PX4_ERR("failed to lock calibration");
+		return;
+	}
+
+	for (unsigned i = 0; i < MAX_SERVOS; ++i) {
+		const DynamixelPositionMapping::Calibration requested {
+			requested_zero[i],
+			requested_direction[i],
+			requested_min[i],
+			requested_max[i]
+		};
+
+		if (!DynamixelPositionMapping::validCalibration(requested)) {
+			PX4_WARN("servo %u calibration rejected: zero=%" PRId32 " dir=%" PRId32
+				 " min=%" PRId32 " max=%" PRId32,
+				 i + 1, requested.zero, requested.direction,
+				 requested.minimum, requested.maximum);
+			continue;
+		}
+
+		_zero_raw[i] = requested.zero;
+		_direction[i] = requested.direction;
+		_min_raw[i] = requested.minimum;
+		_max_raw[i] = requested.maximum;
+	}
+}
+
+void Dynamixel::updateParameters()
+{
+	if (_parameter_update_sub.updated()) {
+		parameter_update_s parameter_update{};
+		_parameter_update_sub.copy(&parameter_update);
+		updateParams();
+		updateCalibration();
+	}
 }
 // ============================================================
 //  Serial (raw POSIX termios)
@@ -106,19 +233,24 @@ bool Dynamixel::openSerial()
 
 	switch (_baudrate) {
 	case 9600:    speed = B9600;    break;
+
 	case 57600:   speed = B57600;   break;
+
 	case 115200:  speed = B115200;  break;
+
 	case 1000000: speed = B1000000; break;
+
 	case 2000000: speed = B2000000; break;
+
 	case 3000000: speed = B3000000; break;
+
 	case 4000000: speed = B4000000; break;
-	// 주의: 4,500,000은 표준 termios 매크로(B4500000)가 없어서
-	//       플랫폼별(NuttX/Linux) 커스텀 보드레이트 설정이 필요함
+
 	default:
-    	 PX4_ERR("unsupported baudrate %d", _baudrate);
-    	 closeSerial();
-    	 return false;
-}
+		PX4_ERR("unsupported baudrate %d", _baudrate);
+		closeSerial();
+		return false;
+	}
 
 	cfsetispeed(&uart_config, speed);
 	cfsetospeed(&uart_config, speed);
@@ -129,25 +261,60 @@ bool Dynamixel::openSerial()
 		return false;
 	}
 
-	tcflush(_uart_fd, TCIOFLUSH);
-	#ifdef TIOCSSINGLEWIRE
-
-	#ifdef SER_SINGLEWIRE_PULLUP
-	const unsigned long sw_arg = SER_SINGLEWIRE_ENABLED | SER_SINGLEWIRE_PULLUP;
-	#else
-	const unsigned long sw_arg = SER_SINGLEWIRE_ENABLED;
-	#endif
-
-	if (ioctl(_uart_fd, TIOCSSINGLEWIRE, sw_arg) < 0) {
-		PX4_WARN("dynamixel: single-wire 설정 실패 - NuttX defconfig 확인");
-	} else {
-		PX4_INFO("dynamixel: single-wire half-duplex 모드 활성화됨");
+	if (tcflush(_uart_fd, TCIOFLUSH) != 0) {
+		PX4_ERR("initial serial flush failed (errno=%d)", errno);
+		closeSerial();
+		return false;
 	}
+
+#if defined(TIOCSSINGLEWIRE) && defined(SER_SINGLEWIRE_ENABLED)
+
+	if (_wire_mode == WireMode::FullDuplexUart) {
+		if (ioctl(_uart_fd, TIOCSSINGLEWIRE, 0) < 0) {
+			PX4_ERR("failed to disable single-wire mode (errno=%d)", errno);
+			closeSerial();
+			return false;
+		}
+
+	} else {
+		unsigned long sw_arg = SER_SINGLEWIRE_ENABLED;
+
+		if (_wire_mode == WireMode::SingleWirePushPull) {
+# ifdef SER_SINGLEWIRE_PUSHPULL
+			sw_arg |= SER_SINGLEWIRE_PUSHPULL;
+# else
+			PX4_ERR("push-pull single-wire is not supported by this platform");
+			closeSerial();
+			return false;
+# endif
+
+		} else {
+# ifdef SER_SINGLEWIRE_PULLUP
+			sw_arg |= SER_SINGLEWIRE_PULLUP;
+# endif
+		}
+
+		if (ioctl(_uart_fd, TIOCSSINGLEWIRE, sw_arg) < 0) {
+			PX4_ERR("failed to enable requested single-wire mode (errno=%d)", errno);
+			closeSerial();
+			return false;
+		}
+	}
+
 #else
-	PX4_INFO("dynamixel: single-wire 미지원 플랫폼 - full-duplex");
+
+	if (_wire_mode != WireMode::FullDuplexUart) {
+		PX4_ERR("requested single-wire mode is not supported by this platform");
+		closeSerial();
+		return false;
+	}
+
 #endif
 
-	PX4_INFO("opened %s @ %d baud", _port, _baudrate);
+	const char *wire_mode = (_wire_mode == WireMode::FullDuplexUart) ? "uart"
+				: (_wire_mode == WireMode::SingleWirePushPull) ? "single-pushpull"
+				: "single";
+	PX4_INFO("opened %s @ %d baud, wire=%s", _port, _baudrate, wire_mode);
 	return true;
 }
 
@@ -159,40 +326,61 @@ void Dynamixel::closeSerial()
 	}
 }
 
-int Dynamixel::serialWrite(const uint8_t *buf, int len)
+int Dynamixel::serialWrite(const uint8_t *buf, int len, hrt_abstime deadline)
 {
-	if (_uart_fd < 0) {
-		return -1;
-	}
-
-	return ::write(_uart_fd, buf, len);
-}
-
-int Dynamixel::serialRead(uint8_t *buf, int len, int timeout_ms)
-{
-	if (_uart_fd < 0) {
+	if (_uart_fd < 0 || buf == nullptr || len <= 0) {
 		return -1;
 	}
 
 	int total = 0;
-	const hrt_abstime start = hrt_absolute_time();
 
-	while (total < len) {
-		int n = ::read(_uart_fd, buf + total, len - total);
+	while (total < len && hrt_absolute_time() < deadline) {
+		const int written = ::write(_uart_fd, buf + total, len - total);
+
+		if (written > 0) {
+			total += written;
+			continue;
+		}
+
+		if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			return -1;
+		}
+
+		px4_usleep(100);
+	}
+
+	return total;
+}
+
+int Dynamixel::serialRead(uint8_t *buf, int len, hrt_abstime deadline)
+{
+	if (_uart_fd < 0 || buf == nullptr || len <= 0) {
+		return -1;
+	}
+
+	int total = 0;
+
+	while (total < len && hrt_absolute_time() < deadline) {
+		const int n = ::read(_uart_fd, buf + total, len - total);
 
 		if (n > 0) {
 			total += n;
 			continue;
 		}
 
-		if (hrt_elapsed_time(&start) > (hrt_abstime)timeout_ms * 1000) {
-			break;
+		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			return -1;
 		}
 
-		px4_usleep(500);
+		px4_usleep(100);
 	}
 
 	return total;
+}
+
+bool Dynamixel::flushInput()
+{
+	return _uart_fd >= 0 && tcflush(_uart_fd, TCIFLUSH) == 0;
 }
 
 // ============================================================
@@ -257,7 +445,11 @@ uint16_t Dynamixel::updateCRC(uint16_t crc_accum, const uint8_t *data, uint16_t 
 int Dynamixel::txPacket(uint8_t *packet)
 {
 	const uint16_t len = packet[PKT_LEN_L] | (packet[PKT_LEN_H] << 8);
-	const uint16_t total_len = PKT_INST + len;
+	const uint32_t total_len = PKT_INST + static_cast<uint32_t>(len);
+
+	if (total_len > MAX_PACKET_LEN || total_len < 10) {
+		return -1;
+	}
 
 	packet[PKT_HEADER0]  = DXL_HEADER0;
 	packet[PKT_HEADER1]  = DXL_HEADER1;
@@ -268,18 +460,28 @@ int Dynamixel::txPacket(uint8_t *packet)
 	packet[total_len - 2] = crc & 0xFF;
 	packet[total_len - 1] = (crc >> 8) & 0xFF;
 
-	const int written = serialWrite(packet, total_len);
+	const hrt_abstime deadline = hrt_absolute_time() + TRANSACTION_TIMEOUT_MS * 1000;
+	const int written = serialWrite(packet, static_cast<int>(total_len), deadline);
 
-	// [추가] TX 버퍼가 실제 회선으로 다 나갈 때까지 대기.
-	//   - O_NONBLOCK이라 write는 큐잉만 하고 곧바로 리턴하므로,
-	//     전송이 끝나기도 전에 읽기를 시작하는 것을 막는다.
-	//   - half-duplex에서는 "송신 완료 → 수신 전환"의 기준점이 되고,
-	//     full-duplex(단선 결선)에서는 우리가 보낸 바이트의 에코보다
-	//     먼저 읽기 시작하는 것을 막아준다.
-	if (_uart_fd >= 0) {
-		tcdrain(_uart_fd);
+	if (written != static_cast<int>(total_len)) {
+		if (written >= 0) {
+			++_timeout_count;
+		}
+
+		return -1;
 	}
 
+	int drain_result = -1;
+
+	do {
+		drain_result = tcdrain(_uart_fd);
+	} while (drain_result != 0 && errno == EINTR && hrt_absolute_time() < deadline);
+
+	if (drain_result != 0) {
+		return -1;
+	}
+
+	++_tx_packet_count;
 	return written;
 }
 
@@ -293,68 +495,70 @@ int Dynamixel::txPacket(uint8_t *packet)
 //   → 단선(반이중) 결선에서 에코가 섞여 들어와도 진짜 status 패킷을 찾아낸다.
 bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t expected_param_len, int timeout_ms)
 {
-	const hrt_abstime start = hrt_absolute_time();
+	if (expected_id > 252 || (expected_param_len > 0 && param_out == nullptr)
+	    || expected_param_len > MAX_PACKET_LEN - PKT_INST - 4) {
+		return false;
+	}
 
-	while ((int)(hrt_elapsed_time(&start) / 1000) < timeout_ms) {
+	const hrt_abstime deadline = hrt_absolute_time() + static_cast<hrt_abstime>(timeout_ms) * 1000;
+
+	while (hrt_absolute_time() < deadline) {
 
 		uint8_t buf[MAX_PACKET_LEN] {};
 
-		// 1) 헤더 0xFF 0xFF 0xFD 동기화 (한 바이트씩 밀어 넣으며 패턴 탐색)
 		int matched = 0;
-		int dbg_cnt = 0;
 
 		while (matched < 3) {
 			uint8_t b = 0;
 
-			if (serialRead(&b, 1, timeout_ms) < 1) {
-				PX4_WARN("dxl : rx timeout, dbg_cnt=%d",dbg_cnt);
-				return false; // timeout: 더 들어오는 바이트 없음
+			if (serialRead(&b, 1, deadline) != 1) {
+				++_timeout_count;
+				return false;
 			}
 
-			PX4_INFO("dxl : rx[%d]=0x%02X", dbg_cnt++, b);
+			if (matched == 0) {
+				matched = (b == DXL_HEADER0) ? 1 : 0;
 
-			if (matched == 0 && b == DXL_HEADER0) { matched = 1; }
+			} else if (matched == 1) {
+				matched = (b == DXL_HEADER1) ? 2 : 0;
 
-			else if (matched == 1 && b == DXL_HEADER1) { matched = 2; }
-
-			else if (matched == 2 && b == DXL_HEADER2) { matched = 3; }
-
-			else if (b == DXL_HEADER0) { matched = 1; } // 어긋나면 부분 재시작
-
-			else { matched = 0; }
+			} else {
+				// Preserve the overlap in FF FF FF FD so the final
+				// FF FF FD sequence is still recognized.
+				matched = (b == DXL_HEADER2) ? 3 : (b == DXL_HEADER0) ? 2 : 0;
+			}
 		}
 
 		buf[PKT_HEADER0] = DXL_HEADER0;
 		buf[PKT_HEADER1] = DXL_HEADER1;
 		buf[PKT_HEADER2] = DXL_HEADER2;
 
-		// 2) reserved + id + len_l + len_h (4바이트)
-		if (serialRead(&buf[PKT_RESERVED], 4, timeout_ms) < 4) {
+		if (serialRead(&buf[PKT_RESERVED], 4, deadline) != 4) {
+			++_timeout_count;
 			return false;
 		}
 
-		const uint16_t len = buf[PKT_LEN_L] | (buf[PKT_LEN_H] << 8); // INST(1)+ERROR(1)+PARAM+CRC(2)
+		const uint16_t len = buf[PKT_LEN_L] | (buf[PKT_LEN_H] << 8);
+
+		if (buf[PKT_RESERVED] != DXL_RESERVED || len < 4 || len > MAX_PACKET_LEN - PKT_INST) {
+			continue;
+		}
+
 		const uint16_t total_len = PKT_INST + len;
 
-		if (len < 4 || total_len > MAX_PACKET_LEN) {
-			continue; // 비정상 길이 → 다음 패킷 탐색
-		}
-
-		// 3) 나머지 (instruction + error + param + crc) 수신
-		if (serialRead(&buf[PKT_INST], len, timeout_ms) < len) {
+		if (serialRead(&buf[PKT_INST], len, deadline) != len) {
+			++_timeout_count;
 			return false;
 		}
 
-		// 4) CRC 검증 (헤더 ~ 파라미터 전체)
 		const uint16_t crc_received = buf[total_len - 2] | (buf[total_len - 1] << 8);
 		const uint16_t crc_calc = updateCRC(0, buf, total_len - 2);
 
 		if (crc_received != crc_calc) {
-			continue; // 깨진 패킷/에코 잔재 → 다음 패킷 탐색
+			++_rx_crc_error_count;
+			continue;
 		}
 
-		// 5) 우리가 기다리는 Status(0x55) + 해당 ID 인가?
-		//    아니라면(대표적으로 우리가 보낸 패킷의 에코) 버리고 계속 탐색.
 		if (buf[PKT_INST] != INST_STATUS || buf[PKT_ID] != expected_id) {
 			continue;
 		}
@@ -362,25 +566,55 @@ bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t 
 		const uint8_t error = buf[PKT_INST + 1];
 
 		if (error != 0) {
-			PX4_WARN("dynamixel: id=%u returned error=0x%02X", expected_id, error);
+			++_rx_device_error_count;
+			PX4_WARN("id=%u returned error=0x%02X",
+				 static_cast<unsigned>(expected_id), static_cast<unsigned>(error));
+			return false;
 		}
 
-		const uint8_t param_len = (len >= 4) ? (len - 4) : 0; // len = inst+error+param+crc
+		const uint16_t param_len = len - 4;
+
+		if (param_len != expected_param_len) {
+			continue;
+		}
 
 		if (param_out != nullptr && expected_param_len > 0) {
-			const uint8_t copy_len = (param_len < expected_param_len) ? param_len : expected_param_len;
-			memcpy(param_out, &buf[PKT_INST + 2], copy_len);
+			memcpy(param_out, &buf[PKT_INST + 2], expected_param_len);
 		}
 
-		return (error == 0);
+		++_rx_status_count;
+		return true;
 	}
 
-	return false; // timeout 안에 원하는 status 패킷을 못 찾음
+	++_timeout_count;
+	return false;
 }
 
 bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
 {
-	if (_uart_fd < 0 || len > 4) {
+	if (!_mutex_initialized) {
+		return false;
+	}
+
+	BusLock lock(_bus_mutex);
+
+	if (!lock.locked()) {
+		return false;
+	}
+
+	const bool success = writeRegisterUnlocked(id, addr, value, len);
+
+	if (id != DXL_BROADCAST_ID) {
+		setConnected(id, success);
+	}
+
+	return success;
+}
+
+bool Dynamixel::writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
+{
+	if (_uart_fd < 0 || (id > 252 && id != DXL_BROADCAST_ID)
+	    || (len != 1 && len != 2 && len != 4)) {
 		return false;
 	}
 
@@ -400,18 +634,38 @@ bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t
 		packet[PKT_INST + 3 + i] = (uint8_t)((value >> (8 * i)) & 0xFF);
 	}
 
-	txPacket(packet);
-
-	if (id == DXL_BROADCAST_ID) {
-		return true; // broadcast에는 status packet이 오지 않음
+	if (!flushInput()) {
+		return false;
 	}
 
-	return rxStatusPacket(id, nullptr, 0, 20);
+	if (txPacket(packet) < 0) {
+		return false;
+	}
+
+	return id == DXL_BROADCAST_ID
+	       || rxStatusPacket(id, nullptr, 0, TRANSACTION_TIMEOUT_MS);
 }
 
 bool Dynamixel::readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out)
 {
-	if (_uart_fd < 0 || id == DXL_BROADCAST_ID) {
+	if (!_mutex_initialized) {
+		return false;
+	}
+
+	BusLock lock(_bus_mutex);
+
+	if (!lock.locked()) {
+		return false;
+	}
+
+	const bool success = readRegisterUnlocked(id, addr, len, data_out);
+	setConnected(id, success);
+	return success;
+}
+
+bool Dynamixel::readRegisterUnlocked(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out)
+{
+	if (_uart_fd < 0 || id > 252 || len < 1 || len > 4 || data_out == nullptr) {
 		return false;
 	}
 
@@ -429,16 +683,34 @@ bool Dynamixel::readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *da
 	packet[PKT_INST + 3] = len & 0xFF;
 	packet[PKT_INST + 4] = (len >> 8) & 0xFF;
 
-	txPacket(packet);
+	if (!flushInput()) {
+		return false;
+	}
 
-	return rxStatusPacket(id, data_out, len, 20);
+	return txPacket(packet) >= 0
+	       && rxStatusPacket(id, data_out, len, TRANSACTION_TIMEOUT_MS);
 }
 
-// [추가] Ping (INST_PING)
-//   status packet의 파라미터로 model number(2) + firmware version(1) = 3바이트가 온다.
-bool Dynamixel::ping(uint8_t id)
+bool Dynamixel::ping(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
 {
-	if (_uart_fd < 0 || id == DXL_BROADCAST_ID) {
+	if (!_mutex_initialized) {
+		return false;
+	}
+
+	BusLock lock(_bus_mutex);
+
+	if (!lock.locked()) {
+		return false;
+	}
+
+	const bool success = pingUnlocked(id, model_number, firmware_version);
+	setConnected(id, success);
+	return success;
+}
+
+bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
+{
+	if (_uart_fd < 0 || id > 252) {
 		return false;
 	}
 
@@ -451,19 +723,45 @@ bool Dynamixel::ping(uint8_t id)
 
 	packet[PKT_INST] = INST_PING;
 
-	txPacket(packet);
-
-	px4_usleep(2000);   // [실험] 송신 완료 + 서보 응답 대기 2ms
-
-	uint8_t dbg[64] {};
-	int n = serialRead(dbg, sizeof(dbg), 50);
-	PX4_INFO("PING id=%u: rx %d bytes", (unsigned)id, n);
-
-	for (int i = 0; i < n; i++) {
-		PX4_INFO("  [%d] 0x%02X", i, (unsigned)dbg[i]);
+	if (!flushInput()) {
+		return false;
 	}
 
-	return (n > 0);
+	if (txPacket(packet) < 0) {
+		return false;
+	}
+
+	uint8_t params[3] {};
+
+	if (!rxStatusPacket(id, params, sizeof(params), TRANSACTION_TIMEOUT_MS)) {
+		return false;
+	}
+
+	if (model_number != nullptr) {
+		*model_number = params[0] | (params[1] << 8);
+	}
+
+	if (firmware_version != nullptr) {
+		*firmware_version = params[2];
+	}
+
+	return true;
+}
+
+void Dynamixel::setConnected(uint8_t id, bool connected)
+{
+	for (unsigned i = 0; i < _active_servo_count; ++i) {
+		if (_servo_ids[i] == id) {
+			if (connected) {
+				_connected_mask |= 1u << i;
+
+			} else {
+				_connected_mask &= ~(1u << i);
+			}
+
+			break;
+		}
+	}
 }
 
 // ============================================================
@@ -473,11 +771,11 @@ bool Dynamixel::ping(uint8_t id)
 int Dynamixel::task_spawn(int argc, char *argv[])
 {
 	_task_id = px4_task_spawn_cmd("dynamixel",
-				       SCHED_DEFAULT,
-				       SCHED_PRIORITY_DEFAULT,
-				       1536,
-				       (px4_main_t)&run_trampoline,
-				       (char *const *)argv);
+				      SCHED_DEFAULT,
+				      SCHED_PRIORITY_DEFAULT,
+				      2048,
+				      (px4_main_t)&run_trampoline,
+				      (char *const *)argv);
 
 	if (_task_id < 0) {
 		_task_id = -1;
@@ -495,16 +793,96 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 
 	const char *device_name = nullptr;
 	int baudrate = 57600;
+	int first_servo_id = 1;
+	int active_servo_count = 1;
+	int feedback_rate_hz = 20;
+	RunMode run_mode = RunMode::Bench;
+	WireMode wire_mode = WireMode::SingleWireOpenDrain;
 
-	while ((ch = px4_getopt(argc, argv, "d:b:", &myoptind, &myoptarg)) != EOF) {
+	while ((ch = px4_getopt(argc, argv, "d:b:m:w:i:n:f:", &myoptind, &myoptarg)) != EOF) {
 		switch (ch) {
 		case 'd':
 			device_name = myoptarg;
 			break;
 
-		case 'b':
-			baudrate = atoi(myoptarg);
+		case 'b': {
+				uint32_t parsed = 0;
+
+				if (!parseUnsignedArgument(myoptarg, 1, 4000000, parsed)) {
+					print_usage("invalid baudrate");
+					return nullptr;
+				}
+
+				baudrate = static_cast<int>(parsed);
+				break;
+			}
+
+		case 'm':
+			if (strcmp(myoptarg, "bench") == 0) {
+				run_mode = RunMode::Bench;
+
+			} else if (strcmp(myoptarg, "auto") == 0) {
+				run_mode = RunMode::Auto;
+
+			} else {
+				print_usage("mode must be bench or auto");
+				return nullptr;
+			}
+
 			break;
+
+		case 'w':
+			if (strcmp(myoptarg, "single") == 0) {
+				wire_mode = WireMode::SingleWireOpenDrain;
+
+			} else if (strcmp(myoptarg, "single-pushpull") == 0) {
+				wire_mode = WireMode::SingleWirePushPull;
+
+			} else if (strcmp(myoptarg, "uart") == 0) {
+				wire_mode = WireMode::FullDuplexUart;
+
+			} else {
+				print_usage("wire mode must be single, single-pushpull, or uart");
+				return nullptr;
+			}
+
+			break;
+
+		case 'i': {
+				uint32_t parsed = 0;
+
+				if (!parseUnsignedArgument(myoptarg, 0, 252, parsed)) {
+					print_usage("first servo ID must be in [0, 252]");
+					return nullptr;
+				}
+
+				first_servo_id = static_cast<int>(parsed);
+				break;
+			}
+
+		case 'n': {
+				uint32_t parsed = 0;
+
+				if (!parseUnsignedArgument(myoptarg, 1, MAX_SERVOS, parsed)) {
+					print_usage("servo count must be in [1, 4]");
+					return nullptr;
+				}
+
+				active_servo_count = static_cast<int>(parsed);
+				break;
+			}
+
+		case 'f': {
+				uint32_t parsed = 0;
+
+				if (!parseUnsignedArgument(myoptarg, 1, 100, parsed)) {
+					print_usage("feedback rate must be in [1, 100] Hz");
+					return nullptr;
+				}
+
+				feedback_rate_hz = static_cast<int>(parsed);
+				break;
+			}
 
 		default:
 			print_usage("unrecognized flag");
@@ -517,7 +895,20 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 		return nullptr;
 	}
 
-	Dynamixel *instance = new Dynamixel(device_name, baudrate);
+	if (strlen(device_name) >= PORT_NAME_MAX) {
+		print_usage("serial device path is too long");
+		return nullptr;
+	}
+
+	if (first_servo_id + active_servo_count - 1 > 252) {
+		print_usage("active servo ID range must end at or below 252");
+		return nullptr;
+	}
+
+	Dynamixel *instance = new Dynamixel(device_name, baudrate, run_mode, wire_mode,
+					    static_cast<uint8_t>(first_servo_id),
+					    static_cast<uint8_t>(active_servo_count),
+					    static_cast<unsigned>(feedback_rate_hz));
 
 	if (instance == nullptr) {
 		PX4_ERR("alloc failed");
@@ -533,51 +924,117 @@ void Dynamixel::run()
 		return;
 	}
 
-	while (!should_exit()) {
-
-		// ---- PX4 -> Dynamixel : servo_command 받아서 Goal Position에 반영 ----
-		servo_command_s cmd;
-
-		if (_servo_command_sub.update(&cmd)) {
-			for (int i = 0; i < 4; i++) {
-				const float angle = cmd.servo_command[i];
-
-				if (!PX4_ISFINITE(angle)) {
-					continue; // disarmed/무효값이면 이 채널은 건드리지 않음
-				}
-
-				const uint32_t position = angleToPosition(angle);
-				writeRegister(_servo_ids[i], ADDR_GOAL_POSITION, position, 4);
-			}
-		}
-
-		// ---- Dynamixel -> PX4 : Present Position 읽어서 servo_angle publish ----
-		servo_angle_s angle_msg{};
-		angle_msg.timestamp = hrt_absolute_time();
-		bool any_ok = false;
-
-		for (int i = 0; i < 4; i++) {
-			uint8_t data[4] {};
-
-			if (readRegister(_servo_ids[i], ADDR_PRESENT_POSITION, 4, data)) {
-				uint32_t raw = 0;
-				memcpy(&raw, data, 4);
-				angle_msg.servo_angle[i] = positionToAngle(raw);
-				any_ok = true;
-
-			} else {
-				angle_msg.servo_angle[i] = NAN;
-			}
-		}
-
-		if (any_ok) {
-			_servo_angle_pub.publish(angle_msg);
-		}
-
-		px4_usleep(20000); // 약 50Hz (실제로는 왕복 지연 때문에 더 느려질 수 있음)
+	if (_run_mode == RunMode::Auto) {
+		_next_feedback_time = hrt_absolute_time();
 	}
 
-	closeSerial();
+	while (!should_exit()) {
+		updateParameters();
+
+		if (_run_mode == RunMode::Bench) {
+			px4_usleep(100000);
+			continue;
+		}
+
+		const hrt_abstime now = hrt_absolute_time();
+		servo_command_s cmd{};
+
+		if (_servo_command_sub.update(&cmd)) {
+			const hrt_abstime command_now = hrt_absolute_time();
+			const bool command_fresh = cmd.timestamp != 0
+						   && command_now >= cmd.timestamp
+						   && command_now - cmd.timestamp <= COMMAND_TIMEOUT_US;
+
+			if (!command_fresh) {
+				PX4_DEBUG("ignored invalid or stale servo_command");
+			}
+
+			for (unsigned i = 0; command_fresh && i < _active_servo_count; ++i) {
+				const float angle = cmd.servo_command[i];
+				uint32_t position = 0;
+
+				if (angleToPosition(i, angle, position)) {
+					writeRegister(_servo_ids[i], ADDR_GOAL_POSITION, position, 4);
+				}
+			}
+		}
+
+		if (now >= _next_feedback_time) {
+			servo_angle_s angle_msg{};
+			angle_msg.valid_mask = 0;
+
+			for (unsigned i = 0; i < MAX_SERVOS; ++i) {
+				angle_msg.servo_angle[i] = NAN;
+			}
+
+			for (unsigned i = 0; i < _active_servo_count; ++i) {
+				uint8_t data[4] {};
+
+				if (readRegister(_servo_ids[i], ADDR_PRESENT_POSITION, 4, data)) {
+					const uint32_t raw = data[0]
+							     | (static_cast<uint32_t>(data[1]) << 8)
+							     | (static_cast<uint32_t>(data[2]) << 16)
+							     | (static_cast<uint32_t>(data[3]) << 24);
+					const float angle = positionToAngle(i, raw);
+
+					if (PX4_ISFINITE(angle)) {
+						angle_msg.servo_angle[i] = angle;
+						angle_msg.valid_mask |= 1u << i;
+					}
+				}
+			}
+
+			angle_msg.timestamp = hrt_absolute_time();
+			_servo_angle_pub.publish(angle_msg);
+
+			_next_feedback_time = angle_msg.timestamp + _feedback_interval_us;
+		}
+
+		px4_usleep(5000);
+	}
+
+	{
+		BusLock lock(_bus_mutex);
+
+		if (lock.locked()) {
+			closeSerial();
+		}
+	}
+}
+
+int Dynamixel::print_status()
+{
+	BusLock lock(_bus_mutex);
+
+	if (!lock.locked()) {
+		PX4_ERR("failed to lock driver state");
+		return 1;
+	}
+
+	const char *run_mode = (_run_mode == RunMode::Bench) ? "bench" : "auto";
+	const char *wire_mode = (_wire_mode == WireMode::FullDuplexUart) ? "uart"
+				: (_wire_mode == WireMode::SingleWirePushPull) ? "single-pushpull"
+				: "single";
+	const unsigned feedback_rate_hz = static_cast<unsigned>(1000000 / _feedback_interval_us);
+
+	PX4_INFO("port=%s baud=%d mode=%s wire=%s servos=%u feedback=%u Hz connected=0x%02x",
+		 _port, _baudrate, run_mode, wire_mode,
+		 static_cast<unsigned>(_active_servo_count), feedback_rate_hz,
+		 static_cast<unsigned>(_connected_mask));
+	PX4_INFO("packets: tx=%" PRIu32 " status=%" PRIu32 " timeout=%" PRIu32
+		 " crc=%" PRIu32 " device_error=%" PRIu32,
+		 _tx_packet_count, _rx_status_count, _timeout_count,
+		 _rx_crc_error_count, _rx_device_error_count);
+
+	for (unsigned i = 0; i < _active_servo_count; ++i) {
+		PX4_INFO("servo %u id=%u connected=%s zero=%" PRId32 " dir=%" PRId32
+			 " min=%" PRId32 " max=%" PRId32,
+			 i + 1, static_cast<unsigned>(_servo_ids[i]),
+			 (_connected_mask & (1u << i)) ? "yes" : "no",
+			 _zero_raw[i], _direction[i], _min_raw[i], _max_raw[i]);
+	}
+
+	return 0;
 }
 
 int Dynamixel::custom_command(int argc, char *argv[])
@@ -591,18 +1048,45 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		return 1;
 	}
 
+	Dynamixel *instance = get_instance();
+
+	if (instance == nullptr) {
+		PX4_ERR("driver instance is unavailable");
+		return 1;
+	}
+
 	if (strcmp(argv[0], "write") == 0) {
 		if (argc != 5) {
 			return print_usage("write requires: <id> <addr> <value> <len>");
 		}
 
-		const uint8_t  id    = (uint8_t)atoi(argv[1]);
-		const uint16_t addr  = (uint16_t)atoi(argv[2]);
-		const uint32_t value = (uint32_t)strtoul(argv[3], nullptr, 0);
-		const uint8_t  len   = (uint8_t)atoi(argv[4]);
+		uint32_t id_value = 0;
+		uint32_t address_value = 0;
+		uint32_t length_value = 0;
 
-		const bool ok = get_instance()->writeRegister(id, addr, value, len);
-		PX4_INFO("write id=%u addr=%u value=%u len=%u -> %s", (unsigned)id, (unsigned)addr, (unsigned)value, (unsigned)len, ok ? "OK" : "FAIL");
+		if (!parseUnsignedArgument(argv[1], 0, 252, id_value)
+		    || !parseUnsignedArgument(argv[2], 0, 65535, address_value, 0)
+		    || !parseUnsignedArgument(argv[4], 1, 4, length_value)
+		    || (length_value != 1 && length_value != 2 && length_value != 4)) {
+			return print_usage("invalid write ID, address, or length (length must be 1, 2, or 4)");
+		}
+
+		const uint32_t maximum_value = length_value == 4 ? UINT32_MAX
+					       : (1u << (length_value * 8u)) - 1u;
+		uint32_t value = 0;
+
+		if (!parseUnsignedArgument(argv[3], 0, maximum_value, value, 0)) {
+			return print_usage("write value does not fit the requested length");
+		}
+
+		const uint8_t id = static_cast<uint8_t>(id_value);
+		const uint16_t address = static_cast<uint16_t>(address_value);
+		const uint8_t length = static_cast<uint8_t>(length_value);
+		const bool ok = instance->writeRegister(id, address, value, length);
+
+		PX4_INFO("write id=%u addr=%u value=%" PRIu32 " len=%u -> %s",
+			 static_cast<unsigned>(id), static_cast<unsigned>(address), value,
+			 static_cast<unsigned>(length), ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;
 	}
 
@@ -611,35 +1095,125 @@ int Dynamixel::custom_command(int argc, char *argv[])
 			return print_usage("read requires: <id> <addr> <len>");
 		}
 
-		const uint8_t  id   = (uint8_t)atoi(argv[1]);
-		const uint16_t addr = (uint16_t)atoi(argv[2]);
-		const uint8_t  len  = (uint8_t)atoi(argv[3]);
+		uint32_t id_value = 0;
+		uint32_t address_value = 0;
+		uint32_t length_value = 0;
+
+		if (!parseUnsignedArgument(argv[1], 0, 252, id_value)
+		    || !parseUnsignedArgument(argv[2], 0, 65535, address_value, 0)
+		    || !parseUnsignedArgument(argv[3], 1, 4, length_value)) {
+			return print_usage("invalid read ID, address, or length (length must be 1..4)");
+		}
+
+		const uint8_t id = static_cast<uint8_t>(id_value);
+		const uint16_t address = static_cast<uint16_t>(address_value);
+		const uint8_t length = static_cast<uint8_t>(length_value);
 		uint8_t data[4] {};
 
-		const bool ok = get_instance()->readRegister(id, addr, len, data);
+		const bool ok = instance->readRegister(id, address, length, data);
 
 		if (ok) {
 			uint32_t value = 0;
-			memcpy(&value, data, len > 4 ? 4 : len);
-			PX4_INFO("read id=%u addr=%u len=%u -> value=%u", (unsigned)id, (unsigned)addr, (unsigned)len, (unsigned)value);
+			memcpy(&value, data, length);
+			PX4_INFO("read id=%u addr=%u len=%u -> value=%" PRIu32,
+				 static_cast<unsigned>(id), static_cast<unsigned>(address),
+				 static_cast<unsigned>(length), value);
 
 		} else {
-			PX4_ERR("read id=%u addr=%u failed", (unsigned)id, (unsigned)addr);
+			PX4_ERR("read id=%u addr=%u failed", static_cast<unsigned>(id), static_cast<unsigned>(address));
 		}
-
 
 		return ok ? 0 : 1;
 	}
 
-	// [추가] ping 커맨드: 브링업 때 서보가 잡히는지 바로 확인용
 	if (strcmp(argv[0], "ping") == 0) {
 		if (argc != 2) {
 			return print_usage("ping requires: <id>");
 		}
 
-		const uint8_t id = (uint8_t)atoi(argv[1]);
-		const bool ok = get_instance()->ping(id);
-		PX4_INFO("ping id=%u -> %s", (unsigned)id, ok ? "OK" : "FAIL");
+		uint32_t id_value = 0;
+
+		if (!parseUnsignedArgument(argv[1], 0, 252, id_value)) {
+			return print_usage("ping ID must be in [0, 252]");
+		}
+
+		const uint8_t id = static_cast<uint8_t>(id_value);
+		uint16_t model_number = 0;
+		uint8_t firmware_version = 0;
+		const bool ok = instance->ping(id, &model_number, &firmware_version);
+
+		if (ok) {
+			PX4_INFO("ping id=%u model=%u firmware=%u -> OK",
+				 static_cast<unsigned>(id), static_cast<unsigned>(model_number),
+				 static_cast<unsigned>(firmware_version));
+
+		} else {
+			PX4_ERR("ping id=%u -> FAIL", static_cast<unsigned>(id));
+		}
+
+		return ok ? 0 : 1;
+	}
+
+	if (strcmp(argv[0], "torque") == 0) {
+		if (argc != 3) {
+			return print_usage("torque requires: <id> <0|1>");
+		}
+
+		uint32_t id_value = 0;
+		uint32_t enable_value = 0;
+
+		if (!parseUnsignedArgument(argv[1], 0, 252, id_value)
+		    || !parseUnsignedArgument(argv[2], 0, 1, enable_value)) {
+			return print_usage("torque requires an ID in [0, 252] and value 0 or 1");
+		}
+
+		const uint8_t id = static_cast<uint8_t>(id_value);
+		const bool ok = instance->enableTorque(id, enable_value == 1);
+		PX4_INFO("torque id=%u value=%u -> %s", static_cast<unsigned>(id),
+			 static_cast<unsigned>(enable_value), ok ? "OK" : "FAIL");
+		return ok ? 0 : 1;
+	}
+
+	if (strcmp(argv[0], "map") == 0) {
+		if (argc != 3) {
+			return print_usage("map requires: <channel 1..4> <angle_rad>");
+		}
+
+		uint32_t channel = 0;
+
+		if (!parseUnsignedArgument(argv[1], 1, MAX_SERVOS, channel)) {
+			return print_usage("map channel must be in [1, 4]");
+		}
+
+		errno = 0;
+		char *end = nullptr;
+		const float angle = strtof(argv[2], &end);
+
+		if (errno == ERANGE || end == argv[2] || *end != '\0' || !PX4_ISFINITE(angle)) {
+			return print_usage("map angle must be a finite number");
+		}
+
+		uint32_t raw = 0;
+		float mapped_angle = NAN;
+		const unsigned servo_index = static_cast<unsigned>(channel - 1u);
+		bool ok = false;
+		{
+			BusLock lock(instance->_bus_mutex);
+
+			if (lock.locked()) {
+				ok = instance->angleToPosition(servo_index, angle, raw);
+
+				if (ok) {
+					mapped_angle = instance->positionToAngle(servo_index, raw);
+				}
+			}
+		}
+
+		if (ok) {
+			PX4_INFO("channel=%u angle=%.5f rad -> raw=%" PRIu32 " -> %.5f rad",
+				 static_cast<unsigned>(channel), (double)angle, raw, (double)mapped_angle);
+		}
+
 		return ok ? 0 : 1;
 	}
 
@@ -655,17 +1229,23 @@ int Dynamixel::print_usage(const char *reason)
 	PRINT_MODULE_DESCRIPTION(
 		R"DESCR_STR(
 ### Description
-Minimal Dynamixel Protocol 2.0 Read/Write driver.
-Half-duplex switching, daisy-chain scheduling, actuator/uORB integration
-등 통신 방식은 아직 구현되지 않았고, ArduPilot의 AP_RobotisServo와
-ROBOTIS DynamixelSDK protocol2_packet_handler를 참고한 raw packet 단위
-Read/Write만 지원한다.
+Dynamixel Protocol 2.0 driver with validated status packets and calibrated
+joint-angle conversion. Bench mode is the safe default: it opens the bus and
+accepts explicit NSH commands without periodically commanding or polling servos.
+Torque is never enabled automatically.
+
+Wire modes:
+- single: direct single-wire, open-drain with pull-up when supported
+- single-pushpull: direct single-wire push-pull (verify bus contention on a scope)
+- uart: normal TX/RX for an external direction-control interface
 
 ### Examples
-$ dynamixel start -d /dev/ttyS3 -b 57600
+$ dynamixel start -d /dev/ttyS1 -b 57600 -m bench -w single -i 1 -n 1
 $ dynamixel ping 1
-$ dynamixel write 1 116 1024 4
+$ dynamixel read 1 0 2
 $ dynamixel read 1 132 4
+$ dynamixel map 1 -0.3
+$ dynamixel torque 1 0
 $ dynamixel stop
 $ dynamixel status
 )DESCR_STR");
@@ -673,10 +1253,17 @@ $ dynamixel status
 	PRINT_MODULE_USAGE_NAME("dynamixel", "driver");
 	PRINT_MODULE_USAGE_COMMAND("start");
 	PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, "<file:dev>", "Serial device", false);
-	PRINT_MODULE_USAGE_PARAM_INT('b', 57600, 9600, 3000000, "Baudrate", true);
+	PRINT_MODULE_USAGE_PARAM_INT('b', 57600, 9600, 4000000, "Baudrate", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('m', "bench", "<bench|auto>", "Run mode", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('w', "single", "<single|single-pushpull|uart>", "Electrical UART mode", true);
+	PRINT_MODULE_USAGE_PARAM_INT('i', 1, 0, 252, "First servo ID", true);
+	PRINT_MODULE_USAGE_PARAM_INT('n', 1, 1, 4, "Number of consecutive servo IDs", true);
+	PRINT_MODULE_USAGE_PARAM_INT('f', 20, 1, 100, "Feedback rate in auto mode", true);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("ping", "ping <id>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("write", "write <id> <addr> <value> <len>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("read", "read <id> <addr> <len>");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("torque", "torque <id> <0|1>");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("map", "map <channel 1..4> <angle_rad>");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 
 	return 0;

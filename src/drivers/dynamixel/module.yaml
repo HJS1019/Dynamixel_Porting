@@ -1,0 +1,49 @@
+module_name: Dynamixel
+
+parameters:
+    - group: Dynamixel
+      definitions:
+        DXL_S${i}_ZERO:
+            description:
+                short: Dynamixel servo ${i} neutral position
+                long: Raw Goal Position corresponding to a joint angle of zero radians.
+            type: int32
+            num_instances: 4
+            instance_start: 1
+            min: 0
+            max: 4095
+            default: 2048
+
+        DXL_S${i}_DIR:
+            description:
+                short: Dynamixel servo ${i} joint direction
+                long: Set to 1 for increasing raw position with positive joint angle, or -1 to reverse it.
+            type: enum
+            values:
+                -1: Reverse
+                1: Normal
+            num_instances: 4
+            instance_start: 1
+            default: 1
+
+        DXL_S${i}_MIN:
+            description:
+                short: Dynamixel servo ${i} minimum commanded position
+                long: Lower raw Goal Position limit applied after joint-angle conversion.
+            type: int32
+            num_instances: 4
+            instance_start: 1
+            min: 0
+            max: 4095
+            default: 1592
+
+        DXL_S${i}_MAX:
+            description:
+                short: Dynamixel servo ${i} maximum commanded position
+                long: Upper raw Goal Position limit applied after joint-angle conversion.
+            type: int32
+            num_instances: 4
+            instance_start: 1
+            min: 0
+            max: 4095
+            default: 2504
