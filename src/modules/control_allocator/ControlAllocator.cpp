@@ -156,17 +156,27 @@ ControlAllocator::Run()
 	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ custom part ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
-	servo_angle_s servo_angle;
+	servo_angle_s servo_angle{};
 
-	if (_servo_angle_sub.update(&servo_angle)){
+	if (_servo_angle_sub.update(&servo_angle)) {
+		const hrt_abstime servo_now = hrt_absolute_time();
+		const bool timestamp_fresh = servo_angle.timestamp != 0
+					     && servo_now >= servo_angle.timestamp
+					     && servo_now - servo_angle.timestamp <= 200000;
+		const bool all_channels_valid = (servo_angle.valid_mask & 0x0F) == 0x0F;
+		bool angles_finite = true;
 
-		_servo_ang(0) = servo_angle.servo_angle[0];
-		_servo_ang(1) = servo_angle.servo_angle[1];
-		_servo_ang(2) = servo_angle.servo_angle[2];
-		_servo_ang(3) = servo_angle.servo_angle[3];
+		for (int i = 0; i < 4; ++i) {
+			angles_finite = angles_finite && PX4_ISFINITE(servo_angle.servo_angle[i]);
+		}
 
-		update_effectiveness_matrix_if_needed();
-		//loop_check_cnt++; 메모리를 계속해서 남기면 루프 부하가 커진다.
+		if (timestamp_fresh && all_channels_valid && angles_finite) {
+			for (int i = 0; i < 4; ++i) {
+				_servo_ang(i) = servo_angle.servo_angle[i];
+			}
+
+			update_effectiveness_matrix_if_needed();
+		}
 
 	}
 

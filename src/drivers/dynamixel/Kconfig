@@ -3,6 +3,6 @@ menuconfig DRIVERS_DYNAMIXEL
 	default n
 	---help---
 		Enable support for the Dynamixel Protocol 2.0 servo driver.
-		This initial version only supports basic Read/Write register
-		access (no daisy-chain scheduling, no half-duplex direction
-		control yet).
+		Supports validated Ping/Read/Write transactions, direct
+		single-wire half-duplex or normal UART through an external
+		direction-control interface, and calibrated joint angles.

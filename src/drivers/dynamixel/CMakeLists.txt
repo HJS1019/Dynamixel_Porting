@@ -5,6 +5,11 @@ px4_add_module(
 	SRCS
 		dynamixel.cpp
 		dynamixel.hpp
+		DynamixelPositionMapping.hpp
+	MODULE_CONFIG
+		module.yaml
 	DEPENDS
 		uORB
 )
+
+px4_add_unit_gtest(SRC DynamixelPositionMappingTest.cpp)
