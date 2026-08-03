@@ -78,6 +78,7 @@ Dynamixel::Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode 
 	}
 
 	_mutex_initialized = (pthread_mutex_init(&_bus_mutex, nullptr) == 0);
+	_cmd_mutex_initialized = (pthread_mutex_init(&_cmd_mutex, nullptr) == 0);
 }
 
 Dynamixel::~Dynamixel()
@@ -86,6 +87,9 @@ Dynamixel::~Dynamixel()
 
 	if (_mutex_initialized) {
 		pthread_mutex_destroy(&_bus_mutex);
+	}
+	if (_cmd_mutex_initialized) {
+		pthread_mutex_destroy(&_cmd_mutex);
 	}
 }
 
@@ -388,7 +392,7 @@ bool Dynamixel::flushInput()
 	const int r = tcflush(_uart_fd, TCIFLUSH);
 
 	if (r != 0) {
-		PX4_WARN("flushInput: tcflush 실패 r=%d errno=%d - 무시하고 진행", r, errno);
+		PX4_DEBUG("flushInput: tcflush 실패 r=%d errno=%d - 무시하고 진행", r, errno);
 	}
 
 	return true;   // ★ tcflush 실패해도 통신은 계속 진행
@@ -474,7 +478,7 @@ int Dynamixel::txPacket(uint8_t *packet)
 	const hrt_abstime deadline = hrt_absolute_time() + TRANSACTION_TIMEOUT_MS * 1000;
 	const int written = serialWrite(packet, static_cast<int>(total_len), deadline);
 
-	PX4_INFO("TX: written=%d expect=%d errno=%d", written, (int)total_len, errno);   // ★추가
+
 
 	if (written != static_cast<int>(total_len)) {
 		if (written >= 0) {
@@ -490,7 +494,7 @@ int Dynamixel::txPacket(uint8_t *packet)
 		drain_result = tcdrain(_uart_fd);
 	} while (drain_result != 0 && errno == EINTR && hrt_absolute_time() < deadline);
 
-	PX4_INFO("TX: drain=%d errno=%d", drain_result, errno);
+
 
 	if (drain_result != 0) {
 		return -1;
@@ -617,14 +621,9 @@ bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t
 		return false;
 	}
 
-	const bool success = writeRegisterUnlocked(id, addr, value, len);
-
-	if (id != DXL_BROADCAST_ID) {
-		setConnected(id, success);
-	}
-
-	return success;
+	return writeRegisterUnlocked(id, addr, value, len);
 }
+
 
 bool Dynamixel::writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
 {
@@ -673,10 +672,9 @@ bool Dynamixel::readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *da
 		return false;
 	}
 
-	const bool success = readRegisterUnlocked(id, addr, len, data_out);
-	setConnected(id, success);
-	return success;
+	return readRegisterUnlocked(id, addr, len, data_out);
 }
+
 
 bool Dynamixel::readRegisterUnlocked(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out)
 {
@@ -709,14 +707,14 @@ bool Dynamixel::readRegisterUnlocked(uint8_t id, uint16_t addr, uint8_t len, uin
 bool Dynamixel::ping(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
 {
 	if (!_mutex_initialized) {
-		PX4_INFO("PING: mutex 미초기화로 리턴");
+
 		return false;
 	}
 
 	BusLock lock(_bus_mutex);
 
 	if (!lock.locked()) {
-		PX4_INFO("PING: lock 획득 실패로 리턴");
+
 		return false;
 	}
 
@@ -725,13 +723,14 @@ bool Dynamixel::ping(uint8_t id, uint16_t *model_number, uint8_t *firmware_versi
 	return success;
 }
 
+
 bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
 {
-	PX4_INFO("PING: enter, fd=%d id=%u", _uart_fd, (unsigned)id);
+
 
 
 	if (_uart_fd < 0 || id > 252) {
-		PX4_INFO("PING: guard fd/id 에서 리턴");
+
 		return false;
 	}
 
@@ -745,11 +744,11 @@ bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmwa
 	packet[PKT_INST] = INST_PING;
 
 	if (!flushInput()) {
-		PX4_INFO("PING: flushInput 실패로 리턴 (errno=%d)", errno);
+
 		return false;
 	}
 
-	PX4_INFO("PING: txPacket 호출 직전");
+
 
 	if (txPacket(packet) < 0) {
 		return false;
@@ -941,6 +940,136 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 	return instance;
 }
 
+// run() 태스크에서 호출된다. 콘솔이 남긴 요청이 있으면 대신 수행하고 결과를 채운다.
+// (이 함수 안에서만 _uart_fd 접근 → fd 소유 태스크가 통신하므로 EBADF가 나지 않는다)
+void Dynamixel::servicePendingCommand()
+{
+	if (!_cmd_mutex_initialized) {
+		return;
+	}
+
+	// 1) 요청이 있는지 확인하고 로컬로 복사
+	PendingCommand job {};
+
+	pthread_mutex_lock(&_cmd_mutex);
+
+	if (_pending.state == CmdState::Requested) {
+		job = _pending;
+	}
+
+	pthread_mutex_unlock(&_cmd_mutex);
+
+	if (job.state != CmdState::Requested) {
+		return;   // 처리할 요청 없음
+	}
+
+	// 2) 실제 통신 수행 (fd가 유효한 태스크)
+	switch (job.type) {
+	case CmdType::Ping: {
+			uint16_t model = 0;
+			uint8_t firmware = 0;
+			job.success = ping(job.id, &model, &firmware);
+			job.model_number = model;
+			job.firmware = firmware;
+			break;
+		}
+
+	case CmdType::Read: {
+			uint8_t data[4] {};
+			job.success = readRegister(job.id, job.addr, job.len, data);
+
+			if (job.success) {
+				uint32_t v = 0;
+				memcpy(&v, data, job.len > 4 ? 4 : job.len);
+				job.result = v;
+			}
+
+			break;
+		}
+
+	case CmdType::Write:
+		job.success = writeRegister(job.id, job.addr, job.value, job.len);
+		break;
+
+	case CmdType::Torque:
+		job.success = enableTorque(job.id, job.value != 0);
+		break;
+
+	default:
+		job.success = false;
+		break;
+	}
+
+	// 3) 결과 기록
+	job.state = CmdState::Done;
+
+	pthread_mutex_lock(&_cmd_mutex);
+	_pending = job;
+	pthread_mutex_unlock(&_cmd_mutex);
+}
+
+// 콘솔(nsh) 스레드에서 호출된다. 요청을 남기고 run()이 처리할 때까지 기다린다.
+// 성공 시 cmd에 결과가 채워진다.
+bool Dynamixel::submitCommand(PendingCommand &cmd)
+{
+	Dynamixel *instance = get_instance();
+
+	if (instance == nullptr || !instance->_cmd_mutex_initialized) {
+		PX4_ERR("driver instance unavailable");
+		return false;
+	}
+
+	// 1) 요청 등록 (이미 처리 중이면 거절)
+	pthread_mutex_lock(&instance->_cmd_mutex);
+
+	if (instance->_pending.state == CmdState::Requested) {
+		pthread_mutex_unlock(&instance->_cmd_mutex);
+		PX4_ERR("another command is in progress, try again");
+		return false;
+	}
+
+	cmd.state = CmdState::Requested;
+	cmd.success = false;
+	instance->_pending = cmd;
+	pthread_mutex_unlock(&instance->_cmd_mutex);
+
+	// 2) run()이 처리할 때까지 대기 (최대 1초)
+	const hrt_abstime deadline = hrt_absolute_time() + 1000000;
+	bool done = false;
+
+	while (hrt_absolute_time() < deadline) {
+		px4_usleep(2000);
+
+		pthread_mutex_lock(&instance->_cmd_mutex);
+
+		if (instance->_pending.state == CmdState::Done) {
+			cmd = instance->_pending;
+			instance->_pending.state = CmdState::Idle;
+			instance->_pending.type = CmdType::None;
+			done = true;
+		}
+
+		pthread_mutex_unlock(&instance->_cmd_mutex);
+
+		if (done) {
+			break;
+		}
+	}
+
+	if (!done) {
+		// 타임아웃: 요청 슬롯을 비워 다음 명령이 막히지 않게 한다
+		pthread_mutex_lock(&instance->_cmd_mutex);
+		instance->_pending.state = CmdState::Idle;
+		instance->_pending.type = CmdType::None;
+		pthread_mutex_unlock(&instance->_cmd_mutex);
+
+		PX4_ERR("command timed out (run() 태스크가 응답하지 않음)");
+		return false;
+	}
+
+	return cmd.success;
+}
+
 void Dynamixel::run()
 {
 	if (!init()) {
@@ -954,6 +1083,7 @@ void Dynamixel::run()
 
 	while (!should_exit()) {
 		updateParameters();
+		servicePendingCommand();   // ★ 콘솔 요청 처리
 
 		if (_run_mode == RunMode::Bench) {
 			px4_usleep(100000);
@@ -1106,7 +1236,13 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		const uint8_t id = static_cast<uint8_t>(id_value);
 		const uint16_t address = static_cast<uint16_t>(address_value);
 		const uint8_t length = static_cast<uint8_t>(length_value);
-		const bool ok = instance->writeRegister(id, address, value, length);
+		PendingCommand cmd {};
+  		cmd.type = CmdType::Write;
+  		cmd.id = id;
+  		cmd.addr = address;
+  		cmd.value = value;
+  		cmd.len = length;
+  		const bool ok = submitCommand(cmd);
 
 		PX4_INFO("write id=%u addr=%u value=%" PRIu32 " len=%u -> %s",
 			 static_cast<unsigned>(id), static_cast<unsigned>(address), value,
@@ -1132,16 +1268,21 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		const uint8_t id = static_cast<uint8_t>(id_value);
 		const uint16_t address = static_cast<uint16_t>(address_value);
 		const uint8_t length = static_cast<uint8_t>(length_value);
-		uint8_t data[4] {};
 
-		const bool ok = instance->readRegister(id, address, length, data);
+
+		PendingCommand cmd {};
+  		cmd.type = CmdType::Read;
+ 		cmd.id = id;
+  		cmd.addr = address;
+  		cmd.len = length;
+  		const bool ok = submitCommand(cmd);
 
 		if (ok) {
-			uint32_t value = 0;
-			memcpy(&value, data, length);
+
+
 			PX4_INFO("read id=%u addr=%u len=%u -> value=%" PRIu32,
 				 static_cast<unsigned>(id), static_cast<unsigned>(address),
-				 static_cast<unsigned>(length), value);
+				 static_cast<unsigned>(length), cmd.result);
 
 		} else {
 			PX4_ERR("read id=%u addr=%u failed", static_cast<unsigned>(id), static_cast<unsigned>(address));
@@ -1162,14 +1303,16 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		}
 
 		const uint8_t id = static_cast<uint8_t>(id_value);
-		uint16_t model_number = 0;
-		uint8_t firmware_version = 0;
-		const bool ok = instance->ping(id, &model_number, &firmware_version);
+
+		PendingCommand cmd {};
+  		cmd.type = CmdType::Ping;
+ 		cmd.id = id;
+  		const bool ok = submitCommand(cmd);
 
 		if (ok) {
 			PX4_INFO("ping id=%u model=%u firmware=%u -> OK",
-				 static_cast<unsigned>(id), static_cast<unsigned>(model_number),
-				 static_cast<unsigned>(firmware_version));
+				 static_cast<unsigned>(id), static_cast<unsigned>(cmd.model_number),
+				 static_cast<unsigned>(cmd.firmware));
 
 		} else {
 			PX4_ERR("ping id=%u -> FAIL", static_cast<unsigned>(id));
@@ -1192,7 +1335,11 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		}
 
 		const uint8_t id = static_cast<uint8_t>(id_value);
-		const bool ok = instance->enableTorque(id, enable_value == 1);
+		PendingCommand cmd {};
+		cmd.type = CmdType::Torque;
+		cmd.id = id;
+  		cmd.value = enable_value;
+  		const bool ok = submitCommand(cmd);
 		PX4_INFO("torque id=%u value=%u -> %s", static_cast<unsigned>(id),
 			 static_cast<unsigned>(enable_value), ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;

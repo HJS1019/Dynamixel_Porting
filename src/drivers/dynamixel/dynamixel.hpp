@@ -34,6 +34,36 @@ public:
 		FullDuplexUart
 	};
 
+	// ---- 콘솔 명령 위임 ----
+	// NuttX는 fd가 태스크별로 관리되어, 콘솔 스레드가 run()의 _uart_fd를 쓰면 EBADF가 난다.
+	// 따라서 콘솔은 요청만 남기고 실제 통신은 run() 태스크가 수행한다.
+	enum class CmdType : uint8_t {
+		None = 0,
+		Ping,
+		Read,
+		Write,
+		Torque
+	};
+
+	enum class CmdState : uint8_t {
+		Idle = 0,
+		Requested,
+		Done
+	};
+
+	struct PendingCommand {
+		CmdType  type{CmdType::None};
+		CmdState state{CmdState::Idle};
+		uint8_t  id{0};
+		uint16_t addr{0};
+		uint32_t value{0};
+		uint8_t  len{0};
+		bool     success{false};
+		uint32_t result{0};        // read 결과값
+		uint16_t model_number{0};  // ping 결과
+		uint8_t  firmware{0};      // ping 결과
+	};
+
 	Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode wire_mode,
 		  uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz);
 	~Dynamixel() override;
@@ -174,6 +204,13 @@ private:
 	uint32_t _rx_crc_error_count{0};
 	uint32_t _rx_device_error_count{0};
 	uint8_t _connected_mask{0};
+
+	PendingCommand _pending {};
+	pthread_mutex_t _cmd_mutex {};
+	bool _cmd_mutex_initialized{false};
+
+	void servicePendingCommand();                    // run()이 호출: 요청 처리
+	static bool submitCommand(PendingCommand &cmd);  // 콘솔이 호출: 요청 제출 + 결과 대기
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::DXL_S1_ZERO>) _param_dxl_s1_zero,
