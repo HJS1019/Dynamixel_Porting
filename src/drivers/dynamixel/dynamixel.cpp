@@ -463,6 +463,8 @@ int Dynamixel::txPacket(uint8_t *packet)
 	const hrt_abstime deadline = hrt_absolute_time() + TRANSACTION_TIMEOUT_MS * 1000;
 	const int written = serialWrite(packet, static_cast<int>(total_len), deadline);
 
+	PX4_INFO("TX: written=%d expect=%d errno=%d", written, (int)total_len, errno);   // ★추가
+
 	if (written != static_cast<int>(total_len)) {
 		if (written >= 0) {
 			++_timeout_count;
@@ -476,6 +478,8 @@ int Dynamixel::txPacket(uint8_t *packet)
 	do {
 		drain_result = tcdrain(_uart_fd);
 	} while (drain_result != 0 && errno == EINTR && hrt_absolute_time() < deadline);
+
+	PX4_INFO("TX: drain=%d errno=%d", drain_result, errno);
 
 	if (drain_result != 0) {
 		return -1;
