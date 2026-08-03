@@ -380,7 +380,18 @@ int Dynamixel::serialRead(uint8_t *buf, int len, hrt_abstime deadline)
 
 bool Dynamixel::flushInput()
 {
-	return _uart_fd >= 0 && tcflush(_uart_fd, TCIFLUSH) == 0;
+	if (_uart_fd < 0) {
+		PX4_WARN("flushInput: fd 무효");
+		return false;
+	}
+
+	const int r = tcflush(_uart_fd, TCIFLUSH);
+
+	if (r != 0) {
+		PX4_WARN("flushInput: tcflush 실패 r=%d errno=%d - 무시하고 진행", r, errno);
+	}
+
+	return true;   // ★ tcflush 실패해도 통신은 계속 진행
 }
 
 // ============================================================
@@ -698,12 +709,14 @@ bool Dynamixel::readRegisterUnlocked(uint8_t id, uint16_t addr, uint8_t len, uin
 bool Dynamixel::ping(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
 {
 	if (!_mutex_initialized) {
+		PX4_INFO("PING: mutex 미초기화로 리턴");
 		return false;
 	}
 
 	BusLock lock(_bus_mutex);
 
 	if (!lock.locked()) {
+		PX4_INFO("PING: lock 획득 실패로 리턴");
 		return false;
 	}
 
@@ -714,7 +727,11 @@ bool Dynamixel::ping(uint8_t id, uint16_t *model_number, uint8_t *firmware_versi
 
 bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmware_version)
 {
+	PX4_INFO("PING: enter, fd=%d id=%u", _uart_fd, (unsigned)id);
+
+
 	if (_uart_fd < 0 || id > 252) {
+		PX4_INFO("PING: guard fd/id 에서 리턴");
 		return false;
 	}
 
@@ -728,8 +745,11 @@ bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmwa
 	packet[PKT_INST] = INST_PING;
 
 	if (!flushInput()) {
+		PX4_INFO("PING: flushInput 실패로 리턴 (errno=%d)", errno);
 		return false;
 	}
+
+	PX4_INFO("PING: txPacket 호출 직전");
 
 	if (txPacket(packet) < 0) {
 		return false;
