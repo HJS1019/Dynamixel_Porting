@@ -540,6 +540,20 @@ parameters:
                 0: Ignore
                 1: Remove first failed motor from effectiveness
             default: 0
+        # ---- 서보(틸트) 얼로케이션 온보드 실행 스위치 ----
+        CA_SERVO_ALLOC:
+            description:
+                short: Enable onboard servo (tilt) allocation
+                long: |
+                  When enabled, ControlAllocator computes tilt servo angles and
+                  publishes servo_command for the dynamixel driver.
+                  Keep disabled while the companion computer (Lattepanda) is
+                  driving the servos, otherwise both will command the same servos.
+            type: int32
+            min: 0
+            max: 1
+            default: 0
+            reboot_required: false
 
 # Mixer
 mixer:
