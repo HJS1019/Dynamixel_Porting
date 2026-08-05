@@ -485,7 +485,7 @@ ControlAllocator::updateServoAllocation(float dt)
 
 		// ── SA 행렬 구성 (원본 allocation_version_1 == false 경로) ──
 		const float r2 = 1.41421356f;   // sqrt(2)
-		const float r_arm = kServoRArm;
+		const float r_arm = 0.01f;
 
 		const float r_arm1 = r_arm - ((xc_s - yc_s) / r2);
 		const float r_arm2 = r_arm + ((xc_s + yc_s) / r2);
