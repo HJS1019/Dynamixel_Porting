@@ -237,6 +237,11 @@ void LoggedTopics::add_default_topics()
 	add_topic_multi("vehicle_thrust_setpoint", 20, 2);
 	add_topic_multi("vehicle_torque_setpoint", 20, 2);
 
+	// ---- 틸트 서보 (Dynamixel) 로깅 ----
+	add_topic("servo_command", 20);      // 얼로케이션이 내는 목표 각도 [rad]
+	add_topic("servo_angle", 20);        // 드라이버가 읽은 실제 각도 [rad]
+	add_topic("thrust_command", 20);     // 모터 추력 f1~f4 (얼로케이션 입력)
+
 	// SYS_HITL: default ground truth logging for simulation
 	int32_t sys_hitl = 0;
 	param_get(param_find("SYS_HITL"), &sys_hitl);
