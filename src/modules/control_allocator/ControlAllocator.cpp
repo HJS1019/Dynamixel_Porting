@@ -653,7 +653,7 @@ ControlAllocator::updateServoAllocation(float dt)
 	} else {
 		_servo_command_pub.publish(servo_cmd);
 	}
-
+}
 void
 ControlAllocator::publish_actuator_controls()
 {
