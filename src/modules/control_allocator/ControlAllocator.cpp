@@ -759,8 +759,17 @@ int ControlAllocator::custom_command(int argc, char *argv[])
 	//   주어진 입력으로 서보 각도를 1회 계산하여 출력한다 (발행하지 않음).
 	//   라떼판다 결과와 숫자를 직접 비교하기 위한 검증용.
 	if (strcmp(argv[0], "servotest") == 0) {
-		if (argc != 8 && argc != 10) {
-			PX4_ERR("usage: servotest <fx> <fy> <tz_trim> <f1> <f2> <f3> <f4> [xc] [yc]");
+		// 마지막 인자가 --publish 이면 실제로 servo_command 를 발행한다.
+		bool do_publish = false;
+		int  nargs = argc;
+
+		if (nargs >= 2 && strcmp(argv[nargs - 1], "--publish") == 0) {
+			do_publish = true;
+			nargs--;                 // --publish 를 인자 수에서 제외
+		}
+
+		if (nargs != 8 && nargs != 10) {
+			PX4_ERR("usage: servotest <fx> <fy> <tz_trim> <f1> <f2> <f3> <f4> [xc] [yc] [--publish]");
 			return 1;
 		}
 
@@ -786,8 +795,8 @@ int ControlAllocator::custom_command(int argc, char *argv[])
 		const float f4 = setThrustLimitation(strtof(argv[7], nullptr));
 
 		// xc, yc 를 생략하면 현재 center_of_mass 값을 사용
-		const float xc_in = (argc == 10) ? strtof(argv[8], nullptr) : instance->xc;
-		const float yc_in = (argc == 10) ? strtof(argv[9], nullptr) : instance->yc;
+		const float xc_in = (nargs == 10) ? strtof(argv[8], nullptr) : instance->xc;
+		const float yc_in = (nargs == 10) ? strtof(argv[9], nullptr) : instance->yc;
 
 		float th[4] {0.f, 0.f, 0.f, 0.f};
 		instance->solveServoAngles(fx, fy, tz_trim, f1, f2, f3, f4, xc_in, yc_in, th);
@@ -801,6 +810,18 @@ int ControlAllocator::custom_command(int argc, char *argv[])
 		PX4_INFO("        th=[%.2f %.2f %.2f %.2f] deg",
 			 (double)(th[0] * 57.2957795f), (double)(th[1] * 57.2957795f),
 			 (double)(th[2] * 57.2957795f), (double)(th[3] * 57.2957795f));
+		if (do_publish) {
+			servo_command_s servo_cmd{};
+
+			for (int i = 0; i < 4; ++i) {
+				servo_cmd.servo_command[i] = th[i];
+			}
+
+			servo_cmd.timestamp = hrt_absolute_time();
+			instance->_servo_command_pub.publish(servo_cmd);
+			PX4_INFO("--> published to servo_command (LPF 미적용, 계산값 직접 발행)");
+		}
+
 		return 0;
 	}
 
