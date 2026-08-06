@@ -215,6 +215,13 @@ private:
 	};
 
 	void updateServoAllocation(float dt);
+
+	// 테스트용: 주어진 입력으로 서보 각도를 1회 계산 (발행하지 않음)
+	//   solveServoAngles() 는 순수 계산 함수이므로 LPF/발행과 분리되어 있다.
+	void solveServoAngles(float fx, float fy, float tz_trim,
+			      float f1, float f2, float f3, float f4,
+			      float xc_in, float yc_in, float th_out[4]) const;
+
 	static float servoClampf(float x, float lo, float hi);
 	static float setThrustLimitation(float f);
 

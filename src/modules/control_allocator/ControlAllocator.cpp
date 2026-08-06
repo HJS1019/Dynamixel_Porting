@@ -48,6 +48,8 @@
 #include <cmath> // isnan()
 #include <uORB/Publication.hpp>
 #include <uORB/topics/custom_dt.h>
+#include <cstdlib>
+#include <cstring>
 
 using namespace matrix;
 using namespace time_literals;
@@ -449,28 +451,74 @@ ControlAllocator::setThrustLimitation(float f)
 //   wrench_servo = (fx, fy, tz_trim, 0)
 //     fx, fy   : 기체를 기울이지 않고 내는 수평력
 //     tz_trim  : MulticopterRateControl 에서 모터(RT)가 감당하지 못한 yaw 몫
+
+// ㅡㅡㅡㅡㅡㅡㅡ 서보 각도 계산 (순수 함수, LPF/발행 없음) ㅡㅡㅡㅡㅡㅡㅡ //
+// updateServoAllocation() 과 servotest 커맨드가 공유한다.
+void
+ControlAllocator::solveServoAngles(float fx, float fy, float tz_trim,
+				   float f1, float f2, float f3, float f4,
+				   float xc_in, float yc_in, float th_out[4]) const
+{
+	const float r2 = 1.41421356f;   // sqrt(2)
+	const float r_arm = kServoRArm;
+
+	const float xc_s = PX4_ISFINITE(xc_in) ? xc_in : 0.f;
+	const float yc_s = PX4_ISFINITE(yc_in) ? yc_in : 0.f;
+
+	const float r_arm1 = r_arm - ((xc_s - yc_s) / r2);
+	const float r_arm2 = r_arm + ((xc_s + yc_s) / r2);
+	const float r_arm3 = r_arm + ((xc_s - yc_s) / r2);
+	const float r_arm4 = r_arm - ((xc_s + yc_s) / r2);
+
+	matrix::SquareMatrix<float, 4> SA;
+	SA(0, 0) =  f1 / r2;     SA(0, 1) =  f2 / r2;     SA(0, 2) = -f3 / r2;     SA(0, 3) = -f4 / r2;
+	SA(1, 0) =  f1 / r2;     SA(1, 1) = -f2 / r2;     SA(1, 2) = -f3 / r2;     SA(1, 3) =  f4 / r2;
+	SA(2, 0) = r_arm1 * f1;  SA(2, 1) =  r_arm2 * f2; SA(2, 2) = r_arm3 * f3;  SA(2, 3) =  r_arm4 * f4;
+	SA(3, 0) = r_arm1 * f1;  SA(3, 1) = -r_arm2 * f2; SA(3, 2) = r_arm3 * f3;  SA(3, 3) = -r_arm4 * f4;
+
+	matrix::Vector<float, 4> wrench_servo;
+	wrench_servo(0) = fx;
+	wrench_servo(1) = fy;
+	wrench_servo(2) = tz_trim;
+	wrench_servo(3) = 0.f;
+
+	// 특이행렬이면 .I() 가 0 행렬 → sin=0 → 각도 0 (중립)
+	const matrix::Vector<float, 4> sine_theta_command = SA.I() * wrench_servo;
+
+	const float sin_max = sinf(kServoThetaMax);
+
+	for (int i = 0; i < 4; ++i) {
+		const float s = servoClampf(sine_theta_command(i), -sin_max, sin_max);
+		th_out[i] = asinf(servoClampf(s, -1.f, 1.f));
+		th_out[i] = servoClampf(th_out[i], -kServoThetaMax, kServoThetaMax);
+	}
+}
+
+
 void
 ControlAllocator::updateServoAllocation(float dt)
 {
-	// (a) 파라미터 스위치가 꺼져 있으면 아무것도 하지 않는다.
-	//     라떼판다가 서보를 제어하는 동안에는 반드시 0 이어야 한다.
-	if (_param_ca_servo_alloc.get() == 0) {
+	// (a) 파라미터 스위치
+	//   0 = off, 1 = 정상(armed 필요), 2 = 테스트(arm 무시, 발행 없음)
+	const int32_t alloc_mode = _param_ca_servo_alloc.get();
+
+	if (alloc_mode == 0) {
 		return;
 	}
+
+	const bool test_mode = (alloc_mode == 2);
 
 	float th_cmd[4] {0.f, 0.f, 0.f, 0.f};
 
 	// (g) disarmed 이면 서보를 움직이지 않는다 (중립 유지)
 	// (e) 한 주기 이전 추력이 아직 없으면 역시 중립
-	const bool allocation_active = _armed && _prev_thrust_valid;
+	//     단 테스트 모드에서는 arm 상태를 무시하고 계산을 수행한다.
+	const bool allocation_active = (test_mode || _armed) && _prev_thrust_valid;
 
 	if (allocation_active) {
 		// ── 입력 준비 ────────────────────────────────────────────
-		// fx, fy : Run() 에서 vehicle_thrust_setpoint 로부터 저장된 값
 		const float fx = PX4_ISFINITE(_thrust_sp(0)) ? _thrust_sp(0) : 0.f;
 		const float fy = PX4_ISFINITE(_thrust_sp(1)) ? _thrust_sp(1) : 0.f;
-
-		// tz_trim : Run() 에서 vehicle_torque_setpoint.yaw_trim 으로부터 저장된 값
 		const float tz_trim = PX4_ISFINITE(_servo_yaw_trim) ? _servo_yaw_trim : 0.f;
 
 		// (d)(e) f1~f4 : 한 주기 이전 할당 결과 + setThrustLimitation
@@ -479,49 +527,8 @@ ControlAllocator::updateServoAllocation(float dt)
 		const float f3 = setThrustLimitation(_prev_thrust(2));
 		const float f4 = setThrustLimitation(_prev_thrust(3));
 
-		// CoM 보정값 (Run() 에서 center_of_mass 로부터 갱신)
-		const float xc_s = PX4_ISFINITE(xc) ? xc : 0.f;
-		const float yc_s = PX4_ISFINITE(yc) ? yc : 0.f;
-
-		// ── SA 행렬 구성 (원본 allocation_version_1 == false 경로) ──
-		const float r2 = 1.41421356f;   // sqrt(2)
-		const float r_arm = 0.01f;
-
-		const float r_arm1 = r_arm - ((xc_s - yc_s) / r2);
-		const float r_arm2 = r_arm + ((xc_s + yc_s) / r2);
-		const float r_arm3 = r_arm + ((xc_s - yc_s) / r2);
-		const float r_arm4 = r_arm - ((xc_s + yc_s) / r2);
-
-		matrix::SquareMatrix<float, 4> SA;
-		SA(0, 0) =  f1 / r2;     SA(0, 1) =  f2 / r2;     SA(0, 2) = -f3 / r2;     SA(0, 3) = -f4 / r2;
-		SA(1, 0) =  f1 / r2;     SA(1, 1) = -f2 / r2;     SA(1, 2) = -f3 / r2;     SA(1, 3) =  f4 / r2;
-		SA(2, 0) = r_arm1 * f1;  SA(2, 1) =  r_arm2 * f2; SA(2, 2) = r_arm3 * f3;  SA(2, 3) =  r_arm4 * f4;
-		SA(3, 0) = r_arm1 * f1;  SA(3, 1) = -r_arm2 * f2; SA(3, 2) = r_arm3 * f3;  SA(3, 3) = -r_arm4 * f4;
-
-		matrix::Vector<float, 4> wrench_servo;
-		wrench_servo(0) = fx;
-		wrench_servo(1) = fy;
-		wrench_servo(2) = tz_trim;
-		wrench_servo(3) = 0.f;
-
-		// ── 풀이 ─────────────────────────────────────────────────
-		// 원본: SA.colPivHouseholderQr().solve(wrench_servo)  (Eigen)
-		// PX4 : 역행렬. 특이행렬이면 .I() 가 0 행렬을 반환하므로
-		//       sin(theta)=0 → 각도 0 → 중립으로 안전하게 떨어진다.
-		const matrix::Vector<float, 4> sine_theta_command = SA.I() * wrench_servo;
-
-		// (A) |sin(theta)| 포화
-		const float sin_max = sinf(kServoThetaMax);
-
-		for (int i = 0; i < 4; ++i) {
-			const float s = servoClampf(sine_theta_command(i), -sin_max, sin_max);
-
-			// (B) asin
-			th_cmd[i] = asinf(servoClampf(s, -1.f, 1.f));
-
-			// (C) 각도 이중 포화 (LPF 입력 보호)
-			th_cmd[i] = servoClampf(th_cmd[i], -kServoThetaMax, kServoThetaMax);
-		}
+		// ── SA 풀이 → asin → 포화 ──────────────────────────────
+		solveServoAngles(fx, fy, tz_trim, f1, f2, f3, f4, xc, yc, th_cmd);
 	}
 
 	// ── payload (5번 서보) : 현재 기체에는 서보가 4개뿐이라 사용하지 않음 ──
@@ -622,8 +629,30 @@ ControlAllocator::updateServoAllocation(float dt)
 	}
 
 	servo_cmd.timestamp = hrt_absolute_time();
-	_servo_command_pub.publish(servo_cmd);
-}
+
+	if (test_mode) {
+		// 테스트 모드: 서보로 내보내지 않고 1초에 한 번만 로그 출력
+		static hrt_abstime last_log = 0;
+		const hrt_abstime now_log = hrt_absolute_time();
+
+		if (now_log - last_log > 1000000) {
+			last_log = now_log;
+			PX4_INFO("[servo alloc TEST] armed=%d fx=%.3f fy=%.3f tz_trim=%.4f",
+				 _armed ? 1 : 0,
+				 (double)_thrust_sp(0), (double)_thrust_sp(1), (double)_servo_yaw_trim);
+			PX4_INFO("    f=[%.2f %.2f %.2f %.2f]  com=[%.4f %.4f]",
+				 (double)_prev_thrust(0), (double)_prev_thrust(1),
+				 (double)_prev_thrust(2), (double)_prev_thrust(3),
+				 (double)xc, (double)yc);
+			PX4_INFO("    th_raw=[%.4f %.4f %.4f %.4f]  th_lpf=[%.4f %.4f %.4f %.4f] rad",
+				 (double)th_cmd[0], (double)th_cmd[1], (double)th_cmd[2], (double)th_cmd[3],
+				 (double)servo_cmd.servo_command[0], (double)servo_cmd.servo_command[1],
+				 (double)servo_cmd.servo_command[2], (double)servo_cmd.servo_command[3]);
+		}
+
+	} else {
+		_servo_command_pub.publish(servo_cmd);
+	}
 
 void
 ControlAllocator::publish_actuator_controls()
@@ -722,6 +751,59 @@ int ControlAllocator::print_status()
 
 int ControlAllocator::custom_command(int argc, char *argv[])
 {
+	if (argc < 1) {
+		return print_usage("unknown command");
+	}
+
+	// servotest <fx> <fy> <tz_trim> <f1> <f2> <f3> <f4> [xc] [yc]
+	//   주어진 입력으로 서보 각도를 1회 계산하여 출력한다 (발행하지 않음).
+	//   라떼판다 결과와 숫자를 직접 비교하기 위한 검증용.
+	if (strcmp(argv[0], "servotest") == 0) {
+		if (argc != 8 && argc != 10) {
+			PX4_ERR("usage: servotest <fx> <fy> <tz_trim> <f1> <f2> <f3> <f4> [xc] [yc]");
+			return 1;
+		}
+
+		if (!is_running()) {
+			PX4_ERR("control_allocator is not running");
+			return 1;
+		}
+
+		ControlAllocator *instance = get_instance();
+
+		if (instance == nullptr) {
+			PX4_ERR("instance unavailable");
+			return 1;
+		}
+
+		const float fx      = strtof(argv[1], nullptr);
+		const float fy      = strtof(argv[2], nullptr);
+		const float tz_trim = strtof(argv[3], nullptr);
+
+		const float f1 = setThrustLimitation(strtof(argv[4], nullptr));
+		const float f2 = setThrustLimitation(strtof(argv[5], nullptr));
+		const float f3 = setThrustLimitation(strtof(argv[6], nullptr));
+		const float f4 = setThrustLimitation(strtof(argv[7], nullptr));
+
+		// xc, yc 를 생략하면 현재 center_of_mass 값을 사용
+		const float xc_in = (argc == 10) ? strtof(argv[8], nullptr) : instance->xc;
+		const float yc_in = (argc == 10) ? strtof(argv[9], nullptr) : instance->yc;
+
+		float th[4] {0.f, 0.f, 0.f, 0.f};
+		instance->solveServoAngles(fx, fy, tz_trim, f1, f2, f3, f4, xc_in, yc_in, th);
+
+		PX4_INFO("input : fx=%.3f fy=%.3f tz_trim=%.4f", (double)fx, (double)fy, (double)tz_trim);
+		PX4_INFO("        f=[%.2f %.2f %.2f %.2f] (after 2.0~55.0 limit)",
+			 (double)f1, (double)f2, (double)f3, (double)f4);
+		PX4_INFO("        com=[%.4f %.4f]", (double)xc_in, (double)yc_in);
+		PX4_INFO("result: th=[%.5f %.5f %.5f %.5f] rad",
+			 (double)th[0], (double)th[1], (double)th[2], (double)th[3]);
+		PX4_INFO("        th=[%.2f %.2f %.2f %.2f] deg",
+			 (double)(th[0] * 57.2957795f), (double)(th[1] * 57.2957795f),
+			 (double)(th[2] * 57.2957795f), (double)(th[3] * 57.2957795f));
+		return 0;
+	}
+
 	return print_usage("unknown command");
 }
 
@@ -740,6 +822,8 @@ as inputs and outputs actuator setpoint messages.
 
 	PRINT_MODULE_USAGE_NAME("control_allocator", "controller");
 	PRINT_MODULE_USAGE_COMMAND("start");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("servotest",
+					 "servotest <fx> <fy> <tz_trim> <f1> <f2> <f3> <f4> [xc] [yc]");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 
 	return 0;

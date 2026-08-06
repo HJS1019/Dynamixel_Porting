@@ -545,13 +545,14 @@ parameters:
             description:
                 short: Enable onboard servo (tilt) allocation
                 long: |
-                  When enabled, ControlAllocator computes tilt servo angles and
-                  publishes servo_command for the dynamixel driver.
-                  Keep disabled while the companion computer (Lattepanda) is
-                  driving the servos, otherwise both will command the same servos.
+                  0: disabled.
+                  1: enabled, publishes servo_command when armed.
+                  2: test mode, computes and logs angles without publishing
+                     (ignores arm state, servos do not move).
+                  Keep at 0 while the companion computer drives the servos.
             type: int32
             min: 0
-            max: 1
+            max: 2
             default: 0
             reboot_required: false
 
