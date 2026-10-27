@@ -85,9 +85,15 @@ void PositionControl::setHorizontalThrustMargin(const float margin)
 }
 
 
-void PositionControl::updateAttitude(matrix::Dcmf R){
+bool PositionControl::updateAttitude(const matrix::Dcmf &R)
+{
+	if (!R.isAllFinite()) {
+		return false;
+	}
 
 	_w2b = R.transpose();
+	_attitude_valid = true;
+	return true;
 }
 
 void PositionControl::updateHoverThrust(const float hover_thrust_new)
@@ -131,9 +137,21 @@ void PositionControl::setVelocityFeedforward(const matrix::Vector4f &vel_ff)
 
 bool PositionControl::update(const float dt, bool arm_flag, bool pos_flag)
 {
-	bool valid = _inputValid();
+	if (arm_flag != _armed_sign) {
+		resetIntegral();
+		_armed_sign = arm_flag;
+	}
 
-	if (valid && arm_flag) {
+	if (!arm_flag) {
+		_vel_sp.zero();
+		_acc_sp.zero();
+		_thr_sp.zero();
+		return true;
+	}
+
+	const bool valid = _inputValid(dt);
+
+	if (valid) {
 
 		{
 			_positionControl();
@@ -161,17 +179,7 @@ bool PositionControl::update(const float dt, bool arm_flag, bool pos_flag)
 
 	}
 
-	if(!arm_flag){
-
-		// FOR SAFETY FLIGHT
-
-		_vel_sp = {0.f, 0.f, 0.f};
-		_acc_sp = {0.f, 0.f, 0.f};
-		_thr_sp = {0.f, 0.f, 0.f};
-
-	}
-
-	if(!pos_flag){
+	if (!pos_flag) {
 		_vel_sp(0) = 0.f;
 		_vel_sp(1) = 0.f;
 
@@ -203,17 +211,13 @@ void PositionControl::_positionControl()
 
 	Vector3f vel_sp_position = (_pos_sp - _pos).emult(_gain_pos_p) - _vel.emult(_gain_pos_d);
 
-	if (!PX4_ISFINITE(_vel_ff(0)) || !PX4_ISFINITE(_vel_ff(1)) || !PX4_ISFINITE(_vel_ff(2))) {
-	_vel_ff(0) = _vel_ff(1) = _vel_ff(2) = 0.f;
-	}
-
 	vel_sp_position(0) += _vel_ff(0);
 	vel_sp_position(1) += _vel_ff(1);
 	vel_sp_position(2) += _vel_ff(2);
 
 	_vel_sp(0) = math::constrain(vel_sp_position(0), -_lim_vel_horizontal, _lim_vel_horizontal);
 	_vel_sp(1) = math::constrain(vel_sp_position(1), -_lim_vel_horizontal, _lim_vel_horizontal);
-	_vel_sp(2) = math::constrain(vel_sp_position(2), static_cast<float>(-1.0), static_cast<float>(1.0));//_lim_vel_down -0.5
+	_vel_sp(2) = math::constrain(vel_sp_position(2), -_lim_vel_up, _lim_vel_down);
 
 }
 
@@ -223,7 +227,7 @@ void PositionControl::_positionControl()
 
 void PositionControl::_velocityControl(const float dt)
 {
-	Vector3f vel_error =  _w2b*(_vel_sp - _vel); // body-frame 속도 오차
+	Vector3f vel_error =  _w2b * (_vel_sp - _vel); // body-frame 속도 오차
 
 	// I gain Calculate
 	_vel_int += vel_error.emult(_gain_vel_i) * dt; // body
@@ -249,9 +253,9 @@ void PositionControl::_velocityControl(const float dt)
 
 
 
-	_thr_sp(0) = mass*_acc_sp(0);
-	_thr_sp(1) = mass*_acc_sp(1);
-	_thr_sp(2) = mass*_acc_sp(2);
+	_thr_sp(0) = mass * _acc_sp(0);
+	_thr_sp(1) = mass * _acc_sp(1);
+	_thr_sp(2) = mass * _acc_sp(2);
 
 
 	// const Vector3f g_world(0.f, 0.f, CONSTANTS_ONE_G); // 중력보상 할려면 이거써라
@@ -260,16 +264,10 @@ void PositionControl::_velocityControl(const float dt)
 	// _thr_sp(1) = mass*_acc_sp(1) + 0.5f * mass*g_body(1); // 중력보상 할려면 이거써라
 	// _thr_sp(2) = mass*_acc_sp(2) + 0.5f * mass*g_body(2); // 중력보상 할려면 이거써라 => 무게추 달고 말고 모델 달라지는거 + step PWM 걱정되서 걍 안씀
 
-
-
-	ControlMath::setZeroIfNanVector3f(vel_error);
-
-
-
 	if ((_thr_sp(2) <= _lim_thr_min && vel_error(2) <= 0.f) ||
 	    (_thr_sp(2) >= _lim_thr_max && vel_error(2) >= 0.f)) {
 		vel_error(2) = 0.f;
-		}
+	}
 
 }
 
@@ -285,13 +283,15 @@ void PositionControl::_accelerationControl()
 	if (!_decouple_horizontal_and_vertical_acceleration) { // 수직방향 추력과 병진방향 추력이 서로 영향을 준다면 --> true
 
 		// Include vertical acceleration setpoint for better horizontal acceleration tracking
-		z_specific_force += _acc_sp(2); // 병진방향으로 이동하면서 발생하는 수직방향의 추력손실을 매꿔주는 텀?
+		z_specific_force += _acc_sp(
+					    2); // 병진방향으로 이동하면서 발생하는 수직방향의 추력손실을 매꿔주는 텀?
 	}
 
 	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
-	Vector3f body_z = Vector3f(-_acc_sp(0), -_acc_sp(1), -z_specific_force).normalized(); // 좌표계를 비행좌표계로 바꾼거
+	Vector3f body_z = Vector3f(-_acc_sp(0), -_acc_sp(1),
+				   -z_specific_force).normalized(); // 좌표계를 비행좌표계로 바꾼거
 	ControlMath::limitTilt(body_z, Vector3f(0, 0, 1), _lim_tilt);
 
 	// NED = North-East-Down 기준 좌표계 (PX4 기본 좌표계)
@@ -306,32 +306,24 @@ void PositionControl::_accelerationControl()
 	_thr_sp = body_z * collective_thrust; //body_z
 }
 
-bool PositionControl::_inputValid()
+bool PositionControl::_inputValid(const float dt) const
 {
-	bool valid = true;
+	const bool gains_finite = _gain_pos_p.isAllFinite() && _gain_pos_d.isAllFinite()
+				  && _gain_vel_p.isAllFinite() && _gain_vel_i.isAllFinite()
+				  && _gain_vel_d.isAllFinite();
+	const bool limits_finite = PX4_ISFINITE(_lim_vel_horizontal) && PX4_ISFINITE(_lim_vel_up)
+				   && PX4_ISFINITE(_lim_vel_down) && PX4_ISFINITE(_lim_thr_min)
+				   && PX4_ISFINITE(_lim_thr_max) && PX4_ISFINITE(_lim_thr_xy_margin)
+				   && PX4_ISFINITE(_lim_tilt) && PX4_ISFINITE(_lim_acc_horizontal)
+				   && PX4_ISFINITE(_lim_acc_vertical) && PX4_ISFINITE(_hover_thrust);
+	const bool state_finite = _pos.isAllFinite() && _vel.isAllFinite() && _vel_dot.isAllFinite()
+				  && PX4_ISFINITE(_yaw);
+	const bool setpoints_finite = _pos_sp.isAllFinite() && _vel_ff.isAllFinite()
+				      && PX4_ISFINITE(_yaw_sp);
 
-	// Every axis x, y, z needs to have some setpoint
-	for (int i = 0; i <= 2; i++) {
-		valid = valid && (PX4_ISFINITE(_pos_sp(i)) || PX4_ISFINITE(_vel_sp(i)) || PX4_ISFINITE(_acc_sp(i)));
-	}
-
-	// x and y input setpoints always have to come in pairs
-	valid = valid && (PX4_ISFINITE(_pos_sp(0)) == PX4_ISFINITE(_pos_sp(1)));
-	valid = valid && (PX4_ISFINITE(_vel_sp(0)) == PX4_ISFINITE(_vel_sp(1)));
-	valid = valid && (PX4_ISFINITE(_acc_sp(0)) == PX4_ISFINITE(_acc_sp(1)));
-
-	// For each controlled state the estimate has to be valid
-	for (int i = 0; i <= 2; i++) {
-		if (PX4_ISFINITE(_pos_sp(i))) {
-			valid = valid && PX4_ISFINITE(_pos(i));
-		}
-
-		if (PX4_ISFINITE(_vel_sp(i))) {
-			valid = valid && PX4_ISFINITE(_vel(i)) && PX4_ISFINITE(_vel_dot(i));
-		}
-	}
-
-	return valid;
+	return PX4_ISFINITE(dt) && dt > 0.f && _attitude_valid && _w2b.isAllFinite()
+	       && gains_finite && limits_finite && state_finite && setpoints_finite
+	       && _vel_int.isAllFinite();
 }
 
 void PositionControl::getLocalPositionSetpoint(vehicle_local_position_setpoint_s &local_position_setpoint) const
@@ -348,14 +340,16 @@ void PositionControl::getLocalPositionSetpoint(vehicle_local_position_setpoint_s
 	_thr_sp.copyTo(local_position_setpoint.thrust);
 }
 
-void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_setpoint,bool &pos_flag, Vector4f &manual_input) const
+void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_setpoint, bool &pos_flag,
+		Vector4f &manual_input) const
 {
 	//ControlMath::thrustToAttitude(_thr_sp, _yaw_sp, attitude_setpoint);
-	matrix::Vector4f blank_vec{0.f,0.f,0.f,0.f};
-	if(pos_flag){
+	matrix::Vector4f blank_vec{0.f, 0.f, 0.f, 0.f};
+
+	if (pos_flag) {
 		ControlMath::setAttitude(_yaw_sp, attitude_setpoint, blank_vec);
-	}
-	else{
+
+	} else {
 		ControlMath::setAttitude(_yaw_sp, attitude_setpoint, manual_input);
 	}
 

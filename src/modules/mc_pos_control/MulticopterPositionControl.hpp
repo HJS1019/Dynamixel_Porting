@@ -60,12 +60,14 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/topics/hover_thrust_estimate.h>
+#include <uORB/topics/multicopter_position_control_status.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/vehicle_constraints.h>
 #include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_land_detected.h>
+#include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/vehicle_attitude.h> //custom
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_local_position_setpoint.h>
@@ -73,6 +75,10 @@
 #include <uORB/topics/custom_control_mode.h> // custom
 #include <uORB/topics/custom_command_position_mode.h> // custom
 #include <uORB/topics/custom_command_velocity_mode.h> // custom
+
+#include "Takeoff/Takeoff.hpp"
+#include <uORB/topics/takeoff_status.h>
+
 
 
 using namespace time_literals;
@@ -104,6 +110,10 @@ private:
 
 	uORB::Publication<vehicle_attitude_setpoint_s>	     _vehicle_attitude_setpoint_pub{ORB_ID(vehicle_attitude_setpoint)};
 	uORB::Publication<vehicle_local_position_setpoint_s> _local_pos_sp_pub{ORB_ID(vehicle_local_position_setpoint)};	/**< vehicle local position setpoint publication */
+	uORB::Publication<takeoff_status_s> _takeoff_status_pub{ORB_ID(takeoff_status)};
+	uORB::Publication<multicopter_position_control_status_s> _controller_status_pub{
+		ORB_ID(multicopter_position_control_status)
+	};
 
 	uORB::SubscriptionCallbackWorkItem _local_pos_sub{this, ORB_ID(vehicle_local_position)};	/**< vehicle local position */
 
@@ -114,6 +124,7 @@ private:
 	uORB::Subscription _vehicle_constraints_sub{ORB_ID(vehicle_constraints)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
+	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _manual_control_setpoint_sub{ORB_ID(manual_control_setpoint)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _custom_control_mode_sub{ORB_ID(custom_control_mode)}; // custom
@@ -124,6 +135,28 @@ private:
 	hrt_abstime _time_position_control_enabled{0};
 
 	vehicle_control_mode_s _vehicle_control_mode{};
+	vehicle_status_s _vehicle_status{};
+	trajectory_setpoint_s _trajectory_setpoint{};
+
+	matrix::Vector4f _auto_pose_setpoint{0.f, 0.f, 0.f, 0.f};
+	matrix::Vector4f _auto_velocity_ff{0.f, 0.f, 0.f, 0.f};
+	bool _auto_mode_active{false};
+	bool _auto_pose_latched{false};
+	bool _mode_changed{false};
+	bool _auto_takeoff{false};
+	bool _auto_land{false};
+	bool _trajectory_fresh{false};
+	bool _takeoff_intent{false};
+	uint8_t _previous_nav_state{vehicle_status_s::NAVIGATION_STATE_MAX};
+	hrt_abstime _auto_mode_entry_time{0};
+	hrt_abstime _last_status_publish{0};
+	matrix::Vector4f _active_pose_setpoint{0.f, 0.f, 0.f, 0.f};
+	matrix::Vector4f _active_velocity_ff{0.f, 0.f, 0.f, 0.f};
+	float _raw_takeoff_ramp{0.f};
+	float _velocity_limit_up{0.f};
+	bool _controller_update_success{false};
+	bool _failsafe_update_success{true};
+	bool _previous_armed{false};
 
 	custom_control_mode_s _custom_control_mode{}; // custom
 	custom_command_position_mode_s _custom_command_position_mode{}; // custom
@@ -212,6 +245,7 @@ private:
 	PositionControl _control; ///< class for core PID position control
 	PositionControlStates _states;
 	GotoControl _goto_control; ///< class for handling smooth goto position setpoints
+	TakeoffHandling _takeoff;   //RTK 용 추가
 
 	hrt_abstime _last_warn{0}; /**< timer when the last warn message was sent out */
 
@@ -233,7 +267,7 @@ private:
 	uint8_t _z_reset_counter{0};
 	uint8_t _heading_reset_counter{0};
 
-	matrix::Vector3f gain_check;
+	matrix::Vector3f gain_check{};
 	matrix::Vector4f pose_setpoint{0.f, 0.f, 0.f, 0.f};
 
 
@@ -248,7 +282,8 @@ private:
 	float pitch = 0.f;
 	float yaw   = 0.f;
 
-	double lat, lon = 0.f;
+	double lat{0.};
+	double lon{0.};
 	float alt = 0.f;
 	float time_count = 0.f;
 	float wave_z = 0.f;
@@ -270,6 +305,21 @@ private:
 	 */
 	PositionControlStates set_vehicle_states(const vehicle_local_position_s &local_pos);
 
+	/** Convert a fresh AUTO trajectory setpoint to the fully actuated controller interface. */
+	void updateAutoSetpoint(const trajectory_setpoint_s &trajectory_setpoint, float dt);
+
+	/** Latch the current finite local pose into a controller setpoint. */
+	bool latchCurrentPose(matrix::Vector4f &setpoint) const;
+
+	/** Return true for navigation states driven by Navigator trajectory setpoints. */
+	static bool isAutoNavigationState(uint8_t nav_state);
+
+	/** Check whether a fresh trajectory contains a usable position or velocity target. */
+	static bool isTrajectorySetpointValid(const trajectory_setpoint_s &trajectory_setpoint);
+
+	/** Publish low-rate controller diagnostics, immediately publishing mode transitions. */
+	void publishControllerStatus(hrt_abstime now);
+
 	/**
 	 * Generate setpoint to bridge no executable setpoint being available.
 	 * Used to handle transitions where no proper setpoint was generated yet and when the received setpoint is invalid.
@@ -284,7 +334,7 @@ private:
 	 * @param[out] setpoint trajectory setpoint struct to be adjusted
 	 */
 
-	 void adjustSetpointForEKFResets(const vehicle_local_position_s &vehicle_local_position,
+	void adjustSetpointForEKFResets(const vehicle_local_position_s &vehicle_local_position,
 					trajectory_setpoint_s &setpoint);
 
 };

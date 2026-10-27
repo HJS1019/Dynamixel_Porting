@@ -2561,6 +2561,7 @@ void Commander::updateControlMode()
 	mode_util::getVehicleControlMode(_vehicle_status.nav_state,
 					 _vehicle_status.vehicle_type, _offboard_control_mode_sub.get(), _vehicle_control_mode);
 	_mode_management.updateControlMode(_vehicle_status.nav_state, _vehicle_control_mode);
+	_vehicle_control_mode.source_id = _vehicle_status.nav_state;
 
 	_vehicle_control_mode.flag_armed = isArmed();
 	_vehicle_control_mode.flag_multicopter_position_control_enabled =

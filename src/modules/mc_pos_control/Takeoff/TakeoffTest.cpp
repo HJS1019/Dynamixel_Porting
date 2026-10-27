@@ -77,3 +77,79 @@ TEST(TakeoffTest, RegularTakeoffRamp)
 	takeoff.updateTakeoffState(true, false, true, 1.f, false, 6500_ms);
 	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::flight);
 }
+
+TEST(TakeoffTest, CustomForceRampStartsAtZero)
+{
+	TakeoffHandling takeoff;
+	takeoff.setSpoolupTime(1.f);
+	takeoff.setTakeoffRampTime(2.f);
+	takeoff.setInitialRampValue(0.f);
+
+	takeoff.updateTakeoffState(false, true, false, 1.f, false, 0);
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 500_ms);
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 2_s);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::ready_for_takeoff);
+	EXPECT_FLOAT_EQ(takeoff.updateRamp(.5f, 1.5f), 0.f);
+
+	takeoff.updateTakeoffState(true, true, true, 1.f, false, 3_s);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::rampup);
+
+	float previous_ramp = 0.f;
+
+	for (int i = 0; i < 4; ++i) {
+		const float ramp = takeoff.updateRamp(.5f, 1.5f);
+		EXPECT_GT(ramp, previous_ramp);
+		EXPECT_LE(ramp, 1.5f);
+		previous_ramp = ramp;
+	}
+
+	EXPECT_FLOAT_EQ(previous_ramp, 1.5f);
+}
+
+TEST(TakeoffTest, RegularStateSequence)
+{
+	TakeoffHandling takeoff;
+	takeoff.setSpoolupTime(1.f);
+	takeoff.setTakeoffRampTime(1.f);
+	takeoff.setInitialRampValue(0.f);
+
+	takeoff.updateTakeoffState(false, true, false, 1.f, false, 0);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::disarmed);
+
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 500_ms);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::spoolup);
+
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 2_s);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::ready_for_takeoff);
+
+	takeoff.updateTakeoffState(true, true, true, 1.f, false, 3_s);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::rampup);
+
+	takeoff.updateRamp(1.f, 1.f);
+	takeoff.updateTakeoffState(true, false, true, 1.f, false, 4_s);
+	EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::flight);
+}
+
+TEST(TakeoffTest, LandedDoesNotRestartRamp)
+{
+	TakeoffHandling takeoff;
+	takeoff.setSpoolupTime(1.f);
+	takeoff.setTakeoffRampTime(4.f);
+	takeoff.setInitialRampValue(0.f);
+
+	takeoff.updateTakeoffState(false, true, false, 1.f, false, 0);
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 500_ms);
+	takeoff.updateTakeoffState(true, true, false, 1.f, false, 2_s);
+	takeoff.updateTakeoffState(true, true, true, 1.f, false, 3_s);
+
+	float previous_ramp = takeoff.updateRamp(.5f, 1.f);
+
+	for (int i = 0; i < 3; ++i) {
+		takeoff.updateTakeoffState(true, true, true, 1.f, false, 3500_ms + i * 500_ms);
+		EXPECT_EQ(takeoff.getTakeoffState(), TakeoffState::rampup);
+
+		const float ramp = takeoff.updateRamp(.5f, 1.f);
+		EXPECT_GT(ramp, previous_ramp);
+		previous_ramp = ramp;
+	}
+}

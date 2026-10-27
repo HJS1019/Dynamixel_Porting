@@ -53,6 +53,7 @@ set(msg_files
 	CenterOfMass.msg
 	TorqueDhat.msg
 	L1AdaptiveStatus.msg
+	MulticopterPositionControlStatus.msg
 	ActionRequest.msg
 	ActuatorArmed.msg
 	ActuatorControlsStatus.msg

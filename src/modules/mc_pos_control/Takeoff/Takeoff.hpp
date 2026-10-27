@@ -62,6 +62,7 @@ public:
 	// initialize parameters
 	void setSpoolupTime(const float seconds) { _spoolup_time_hysteresis.set_hysteresis_time_from(false, seconds * 1_s); }
 	void setTakeoffRampTime(const float seconds) { _takeoff_ramp_time = seconds; }
+	void setInitialRampValue(const float initial_ramp_value) { _takeoff_ramp_vz_init = initial_ramp_value; }
 
 	/**
 	 * Calculate a vertical velocity to initialize the takeoff ramp
@@ -88,7 +89,7 @@ public:
 	 */
 	float updateRamp(const float dt, const float takeoff_desired_vz);
 
-	TakeoffState getTakeoffState() { return _takeoff_state; }
+	TakeoffState getTakeoffState() const { return _takeoff_state; }
 
 private:
 	TakeoffState _takeoff_state = TakeoffState::disarmed;

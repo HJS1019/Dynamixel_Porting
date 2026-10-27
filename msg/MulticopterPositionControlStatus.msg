@@ -1,0 +1,24 @@
+uint64 timestamp
+
+uint8 nav_state
+bool auto_takeoff
+bool auto_land
+bool mode_changed
+bool trajectory_fresh
+bool takeoff_intent
+
+uint8 takeoff_state
+float32 raw_takeoff_ramp
+float32 velocity_limit_up
+
+float32 active_position_z
+float32 active_velocity_z
+float32 velocity_setpoint_z
+float32 acceleration_setpoint_z
+float32 force_setpoint_z
+
+bool landed
+bool ground_contact
+bool attitude_valid
+bool controller_update_success
+bool failsafe_update_success
