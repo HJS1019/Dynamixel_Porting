@@ -109,8 +109,220 @@ bool Dynamixel::init()
 	}
 
 	_connected_mask = 0;
-	PX4_INFO("bus idle; torque state unchanged (use explicit NSH commands)");
+
+	if (_run_mode == RunMode::Auto) {
+		PX4_INFO("auto mode: torque will be enabled automatically and servos held at neutral");
+
+	} else {
+		PX4_INFO("bus idle; torque state unchanged (use explicit NSH commands)");
+	}
+
 	return true;
+}
+
+// ============================================================
+//  토크 자동 관리 (auto 모드)
+// ============================================================
+//
+// 라떼판다 시절의 준비 과정
+//   ssh 접속 → dynamixel_fix 실행(Operating Mode=3, 토크 ON, 0 rad = 2048 고정)
+// 을 Pixhawk 부팅만으로 대신하기 위한 부분이다.
+//
+// 서보 1개를 점검하는 순서
+//   ① Torque Enable(64) 읽기  → 응답이 오는지 + 토크가 켜져 있는지 동시에 확인
+//   ② 토크가 꺼져 있으면 Operating Mode(11) 가 3(위치 제어)인지 확인
+//   ③ Goal Position 을 먼저 써 둔다 (토크를 켜는 순간 이 위치로 가기 때문)
+//        - 평소: 중립(0 rad → DXL_Sn_ZERO, 기본 2048)
+//        - 최근 100 ms 안에 보낸 명령이 있으면(=비행 중 서보가 리셋된 경우) 그 위치
+//   ④ Torque Enable = 1
+//   ⑤ 다시 읽어서 1 인지 확인 → Ready
+//
+// 이 함수는 run() 태스크에서만 호출된다 (UART fd 소유 태스크).
+
+void Dynamixel::checkServoHealth(unsigned servo_index, hrt_abstime now)
+{
+	if (servo_index >= _active_servo_count) {
+		return;
+	}
+
+	const uint8_t id = _servo_ids[servo_index];
+	const uint8_t bit = static_cast<uint8_t>(1u << servo_index);
+
+	// ① 토크 상태 읽기 (응답 확인 겸용)
+	uint8_t torque = 0;
+	_last_status_error = 0;
+
+	if (!readRegister(id, ADDR_TORQUE_ENABLE, 1, &torque)) {
+		if (_last_status_error & STATUS_ERROR_ALERT_BIT) {
+			// 서보는 응답했지만 "하드웨어 에러" 상태 (과부하, 과열, 전압 이상 등).
+			// 이 상태에서는 서보가 토크를 스스로 끄고, 전원을 다시 넣기 전까지 켜지지 않는다.
+			_health_fail_count[servo_index] = 0;
+			setServoHealth(servo_index, ServoHealth::HardwareError);
+			return;
+		}
+
+		// 통신 잡음 한두 번으로 상태가 흔들리지 않도록 연속 실패 횟수를 센다
+		if (_health_fail_count[servo_index] < UINT8_MAX) {
+			++_health_fail_count[servo_index];
+		}
+
+		if (_health_fail_count[servo_index] >= HEALTH_FAIL_LIMIT) {
+			setServoHealth(servo_index, ServoHealth::NoResponse);
+		}
+
+		return;
+	}
+
+	_health_fail_count[servo_index] = 0;
+
+	if (torque == 1) {
+		setServoHealth(servo_index, ServoHealth::Ready);
+		return;
+	}
+
+	// 토크가 꺼져 있음
+	if (_manual_torque_off_mask & bit) {
+		// 사람이 콘솔에서 일부러 끈 경우에는 다시 켜지 않는다
+		setServoHealth(servo_index, ServoHealth::ManualOff);
+		return;
+	}
+
+	// ② 위치 제어 모드인지 확인 (EEPROM 값이라 쓰지는 않고 읽기만 한다)
+	uint8_t operating_mode = 0;
+
+	if (!readRegister(id, ADDR_OPERATING_MODE, 1, &operating_mode)) {
+		return; // 다음 점검 때 다시 시도
+	}
+
+	if (operating_mode != OPERATING_MODE_POSITION) {
+		setServoHealth(servo_index, ServoHealth::BadMode);
+		return;
+	}
+
+	// ③ 목표 위치를 먼저 써 둔다
+	uint32_t goal_position = 0;
+	const bool recent_command = _last_goal_time[servo_index] != 0
+				    && now >= _last_goal_time[servo_index]
+				    && now - _last_goal_time[servo_index] <= COMMAND_TIMEOUT_US;
+
+	if (recent_command) {
+		goal_position = _last_goal_position[servo_index];
+
+	} else if (!angleToPosition(servo_index, 0.f, goal_position)) {
+		return;
+	}
+
+	if (!writeRegister(id, ADDR_GOAL_POSITION, goal_position, 4)) {
+		return;
+	}
+
+	// ④ 토크 ON
+	if (!enableTorque(id, true)) {
+		return;
+	}
+
+	// ⑤ 실제로 켜졌는지 확인
+	uint8_t verify = 0;
+
+	if (readRegister(id, ADDR_TORQUE_ENABLE, 1, &verify) && verify == 1) {
+		PX4_INFO("servo %u (id=%u): torque ON, holding raw=%" PRIu32 "%s",
+			 servo_index + 1, static_cast<unsigned>(id), goal_position,
+			 recent_command ? " (last command)" : " (neutral)");
+		setServoHealth(servo_index, ServoHealth::Ready);
+	}
+}
+
+void Dynamixel::setServoHealth(unsigned servo_index, ServoHealth health)
+{
+	if (servo_index >= MAX_SERVOS) {
+		return;
+	}
+
+	const uint8_t bit = static_cast<uint8_t>(1u << servo_index);
+	const uint8_t active_mask = static_cast<uint8_t>((1u << _active_servo_count) - 1u);
+	const bool was_all_ready = (_ready_mask & active_mask) == active_mask;
+
+	if (health == ServoHealth::Ready) {
+		_ready_mask |= bit;
+
+	} else {
+		_ready_mask &= ~bit;
+	}
+
+	const bool is_all_ready = (_ready_mask & active_mask) == active_mask;
+
+	if (_servo_health[servo_index] == health) {
+		return; // 상태가 바뀔 때만 알린다 (메시지 도배 방지)
+	}
+
+	_servo_health[servo_index] = health;
+	const unsigned id = _servo_ids[servo_index];
+
+	switch (health) {
+	case ServoHealth::NoResponse:
+		PX4_WARN("servo %u (id=%u) not responding", servo_index + 1, id);
+		mavlink_log_critical(&_mavlink_log_pub, "Tilt servo %u (ID %u) not responding", servo_index + 1, id);
+		break;
+
+	case ServoHealth::BadMode:
+		PX4_WARN("servo %u (id=%u) not in position mode, torque left OFF", servo_index + 1, id);
+		mavlink_log_critical(&_mavlink_log_pub, "Tilt servo %u (ID %u) not in position mode", servo_index + 1, id);
+		break;
+
+	case ServoHealth::HardwareError:
+		PX4_ERR("servo %u (id=%u) hardware error, power cycle the servo", servo_index + 1, id);
+		mavlink_log_critical(&_mavlink_log_pub, "Tilt servo %u (ID %u) hardware error, power cycle", servo_index + 1, id);
+		break;
+
+	case ServoHealth::ManualOff:
+		PX4_INFO("servo %u (id=%u) torque OFF by console command", servo_index + 1, id);
+		break;
+
+	default:
+		break;
+	}
+
+	if (is_all_ready && !was_all_ready) {
+		PX4_INFO("all %u tilt servos ready (torque ON)", static_cast<unsigned>(_active_servo_count));
+		mavlink_log_info(&_mavlink_log_pub, "Tilt servos ready (%u/%u)",
+				 static_cast<unsigned>(_active_servo_count), static_cast<unsigned>(_active_servo_count));
+	}
+}
+
+// 콘솔에서 토크를 직접 켜고 끈 것을 기억한다.
+//   torque 0 → 자동 관리가 다시 켜지 않음 (점검·분해 작업용)
+//   torque 1 → 다시 자동 관리 대상
+void Dynamixel::noteManualTorque(uint8_t id, bool enabled)
+{
+	for (unsigned i = 0; i < _active_servo_count; ++i) {
+		if (_servo_ids[i] == id || id == DXL_BROADCAST_ID) {
+			const uint8_t bit = static_cast<uint8_t>(1u << i);
+
+			if (enabled) {
+				_manual_torque_off_mask &= ~bit;
+
+			} else {
+				_manual_torque_off_mask |= bit;
+			}
+		}
+	}
+}
+
+const char *Dynamixel::healthName(ServoHealth health)
+{
+	switch (health) {
+	case ServoHealth::NoResponse:    return "no-response";
+
+	case ServoHealth::BadMode:       return "bad-mode";
+
+	case ServoHealth::HardwareError: return "hw-error";
+
+	case ServoHealth::ManualOff:     return "manual-off";
+
+	case ServoHealth::Ready:         return "ready";
+
+	default:                         return "unknown";
+	}
 }
 
 bool Dynamixel::enableTorque(uint8_t id, bool enable)
@@ -583,6 +795,7 @@ bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t 
 		}
 
 		const uint8_t error = buf[PKT_INST + 1];
+		_last_status_error = error;   // 토크 자동 관리에서 하드웨어 에러(Alert 비트) 판별용으로 기록만 한다
 
 		if (error != 0) {
 			++_rx_device_error_count;
@@ -989,10 +1202,21 @@ void Dynamixel::servicePendingCommand()
 
 	case CmdType::Write:
 		job.success = writeRegister(job.id, job.addr, job.value, job.len);
+
+		// 'write <id> 64 <0|1> 1' 로 토크를 직접 바꾼 경우도 수동 조작으로 기억
+		if (job.success && job.addr == ADDR_TORQUE_ENABLE && job.len == 1) {
+			noteManualTorque(job.id, job.value != 0);
+		}
+
 		break;
 
 	case CmdType::Torque:
 		job.success = enableTorque(job.id, job.value != 0);
+
+		if (job.success) {
+			noteManualTorque(job.id, job.value != 0);
+		}
+
 		break;
 
 	default:
@@ -1079,6 +1303,7 @@ void Dynamixel::run()
 
 	if (_run_mode == RunMode::Auto) {
 		_next_feedback_time = hrt_absolute_time();
+		_next_health_check_time = hrt_absolute_time();
 	}
 
 	while (!should_exit()) {
@@ -1108,14 +1333,27 @@ void Dynamixel::run()
 				uint32_t position = 0;
 
 				if (angleToPosition(i, angle, position)) {
-					writeRegister(_servo_ids[i], ADDR_GOAL_POSITION, position, 4);
+					if (writeRegister(_servo_ids[i], ADDR_GOAL_POSITION, position, 4)) {
+						// 토크 재활성화 시 "마지막 명령 위치"로 켜기 위해 기억
+						_last_goal_position[i] = position;
+						_last_goal_time[i] = hrt_absolute_time();
+					}
 				}
 			}
+		}
+
+		// 토크 자동 관리: 250 ms 마다 서보 1개씩 돌아가며 점검 (서보당 1초 주기)
+		if (now >= _next_health_check_time) {
+			checkServoHealth(_health_check_index, now);
+			_health_check_index = (_health_check_index + 1) % _active_servo_count;
+			_next_health_check_time = now + HEALTH_CHECK_INTERVAL_US;
 		}
 
 		if (now >= _next_feedback_time) {
 			servo_angle_s angle_msg{};
 			angle_msg.valid_mask = 0;
+			angle_msg.active_mask = static_cast<uint8_t>((1u << _active_servo_count) - 1u);
+			angle_msg.ready_mask = _ready_mask;   // arm 차단 점검(commander)이 사용
 
 			for (unsigned i = 0; i < MAX_SERVOS; ++i) {
 				angle_msg.servo_angle[i] = NAN;
@@ -1186,6 +1424,16 @@ int Dynamixel::print_status()
 			 i + 1, static_cast<unsigned>(_servo_ids[i]),
 			 (_connected_mask & (1u << i)) ? "yes" : "no",
 			 _zero_raw[i], _direction[i], _min_raw[i], _max_raw[i]);
+	}
+
+	if (_run_mode == RunMode::Auto) {
+		// 토크 자동 관리 상태 (ready 가 4개 모두 나와야 arm 가능)
+		for (unsigned i = 0; i < _active_servo_count; ++i) {
+			PX4_INFO("servo %u health=%s%s", i + 1, healthName(_servo_health[i]),
+				 (_manual_torque_off_mask & (1u << i)) ? " (manual torque off)" : "");
+		}
+
+		PX4_INFO("ready_mask=0x%02x", static_cast<unsigned>(_ready_mask));
 	}
 
 	return 0;
@@ -1403,7 +1651,13 @@ int Dynamixel::print_usage(const char *reason)
 Dynamixel Protocol 2.0 driver with validated status packets and calibrated
 joint-angle conversion. Bench mode is the safe default: it opens the bus and
 accepts explicit NSH commands without periodically commanding or polling servos.
-Torque is never enabled automatically.
+In bench mode torque is never enabled automatically.
+
+In auto mode the driver checks one servo every 250 ms. If a servo responds, is
+in position mode (Operating Mode 3) and its torque is off, the driver writes the
+neutral Goal Position (DXL_Sn_ZERO) and enables torque. A servo whose torque was
+turned off with 'torque <id> 0' is left off until 'torque <id> 1'.
+On fmu-v6c the driver is started at boot when DXL_EN is 1 (rc.board_extras).
 
 Wire modes:
 - single: direct single-wire, open-drain with pull-up when supported

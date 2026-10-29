@@ -15,6 +15,7 @@
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/servo_command.h>
 #include <uORB/topics/servo_angle.h>
+#include <systemlib/mavlink_log.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -159,9 +160,13 @@ private:
 	void setConnected(uint8_t id, bool connected);
 
 	// X-series 공통 control table 주소 (모델 다르면 값 확인 필요)
+	static constexpr uint16_t ADDR_OPERATING_MODE  = 11;   // EEPROM, 1 byte (3 = 위치 제어)
 	static constexpr uint16_t ADDR_TORQUE_ENABLE   = 64;
 	static constexpr uint16_t ADDR_GOAL_POSITION   = 116;
 	static constexpr uint16_t ADDR_PRESENT_POSITION = 132;
+
+	static constexpr uint8_t OPERATING_MODE_POSITION = 3;
+	static constexpr uint8_t STATUS_ERROR_ALERT_BIT  = 0x80; // status packet error 바이트의 Alert 비트 = 하드웨어 에러 발생
 
 	static constexpr unsigned MAX_SERVOS = 4;
 	static constexpr size_t PORT_NAME_MAX = 32;
@@ -211,6 +216,40 @@ private:
 
 	void servicePendingCommand();                    // run()이 호출: 요청 처리
 	static bool submitCommand(PendingCommand &cmd);  // 콘솔이 호출: 요청 제출 + 결과 대기
+
+	// ---- 토크 자동 관리 (auto 모드 전용) ----
+	// 라떼판다의 dynamixel_fix 가 하던 "토크 ON + 중립(2048) 고정"을 드라이버가 직접 한다.
+	// 서보를 한 번에 하나씩 돌아가며 점검해서(250 ms 간격 → 서보당 1초) 통신 부담을 분산한다.
+	enum class ServoHealth : uint8_t {
+		Unknown = 0,     // 아직 점검 전
+		NoResponse,      // 연속으로 응답 없음 (전원/배선 확인)
+		BadMode,         // Operating Mode != 3 (위치 제어 아님) → 토크를 켜지 않는다
+		HardwareError,   // 과부하·전압 이상 등으로 서보가 스스로 셧다운 (전원 재투입 필요)
+		ManualOff,       // 콘솔에서 'torque <id> 0' 으로 끈 상태 → 자동으로 다시 켜지 않는다
+		Ready            // 응답 OK + 위치 제어 모드 + 토크 ON 확인
+	};
+
+	static constexpr hrt_abstime HEALTH_CHECK_INTERVAL_US = 250000;
+	static constexpr uint8_t HEALTH_FAIL_LIMIT = 3;  // 연속 3회(약 3초) 무응답이면 NoResponse
+
+	void checkServoHealth(unsigned servo_index, hrt_abstime now);
+	void setServoHealth(unsigned servo_index, ServoHealth health);
+	void noteManualTorque(uint8_t id, bool enabled);
+	static const char *healthName(ServoHealth health);
+
+	ServoHealth _servo_health[MAX_SERVOS] {};
+	uint8_t _health_fail_count[MAX_SERVOS] {};
+	uint8_t _ready_mask{0};               // bit i = 서보 i 가 Ready
+	uint8_t _manual_torque_off_mask{0};   // bit i = 콘솔에서 토크를 직접 끈 서보
+	unsigned _health_check_index{0};
+	hrt_abstime _next_health_check_time{0};
+	uint8_t _last_status_error{0};        // 마지막으로 받은 status packet 의 error 바이트
+
+	// 비행 중 서보가 리셋되었을 때, 중립이 아니라 "마지막으로 보낸 목표 위치"로 토크를 다시 켜기 위해 기억
+	uint32_t _last_goal_position[MAX_SERVOS] {};
+	hrt_abstime _last_goal_time[MAX_SERVOS] {};
+
+	orb_advert_t _mavlink_log_pub{nullptr};  // QGC 메시지 창으로 보내는 알림
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::DXL_S1_ZERO>) _param_dxl_s1_zero,
