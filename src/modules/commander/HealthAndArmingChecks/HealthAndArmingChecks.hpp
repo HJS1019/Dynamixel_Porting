@@ -46,6 +46,7 @@
 #include "checks/baroCheck.hpp"
 #include "checks/cpuResourceCheck.hpp"
 #include "checks/distanceSensorChecks.hpp"
+#include "checks/dynamixelCheck.hpp"
 #include "checks/escCheck.hpp"
 #include "checks/estimatorCheck.hpp"
 #include "checks/failureDetectorCheck.hpp"
@@ -125,6 +126,7 @@ private:
 	BaroChecks _baro_checks;
 	CpuResourceChecks _cpu_resource_checks;
 	DistanceSensorChecks _distance_sensor_checks;
+	DynamixelChecks _dynamixel_checks;
 	EscChecks _esc_checks;
 	EstimatorChecks _estimator_checks;
 	FailureDetectorChecks _failure_detector_checks;
@@ -162,6 +164,7 @@ private:
 		&_baro_checks,
 		&_cpu_resource_checks,
 		&_distance_sensor_checks,
+		&_dynamixel_checks,
 		&_esc_checks,
 		&_estimator_checks,
 		&_failure_detector_checks,
