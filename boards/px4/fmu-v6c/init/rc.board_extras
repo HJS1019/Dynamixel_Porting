@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# fmu-v6c board specific extras
+#
+# rcS(부팅 스크립트)가 센서, MAVLink, GPS 등을 모두 띄운 뒤
+# 로거를 시작하기 직전에 이 파일을 자동으로 실행한다.
+#------------------------------------------------------------------------------
+
+#
+# 틸트 서보(Dynamixel XL430 x4) 드라이버 자동 시작
+#
+# DXL_EN = 1 일 때만 실행한다. (QGC에서 설정, 기본값 0)
+#   - TELEM3 = /dev/ttyS1
+#   - 1 Mbit/s, 서보 ID 1~4 (4개)
+#   - auto 모드: 드라이버가 스스로 토크를 켜고 중립(DXL_Sn_ZERO, 기본 2048)에 고정한 뒤
+#                ControlAllocator 가 내는 servo_command 를 따라간다.
+#   - 배선 모드: 현재 임시 레벨시프터 회로(TXB0104) 때문에 single-pushpull.
+#                정식 회로(BSS138 등 오픈드레인 호환)로 바꾸면 '-w single' 로 변경할 것.
+#
+if param compare -s DXL_EN 1
+then
+	dynamixel start -d /dev/ttyS1 -b 1000000 -m auto -w single-pushpull -i 1 -n 4
+fi

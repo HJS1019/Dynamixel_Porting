@@ -3,6 +3,20 @@ module_name: Dynamixel
 parameters:
     - group: Dynamixel
       definitions:
+        DXL_EN:
+            description:
+                short: Start the Dynamixel tilt-servo driver at boot
+                long: |
+                    If enabled, the fmu-v6c board startup script (rc.board_extras) starts
+                    the dynamixel driver in auto mode on TELEM3 (/dev/ttyS1, 1 Mbit/s,
+                    servo IDs 1-4). In auto mode the driver enables torque by itself and
+                    holds the servos at the neutral position (DXL_Sn_ZERO), and arming is
+                    blocked until all servos report ready.
+                    Disable this for bench tests where the driver is started manually.
+            type: boolean
+            default: 0
+            reboot_required: true
+
         DXL_S${i}_ZERO:
             description:
                 short: Dynamixel servo ${i} neutral position
