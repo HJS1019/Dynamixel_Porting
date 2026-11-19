@@ -131,11 +131,18 @@ bool Dynamixel::init()
 // 서보 1개를 점검하는 순서
 //   ① Torque Enable(64) 읽기  → 응답이 오는지 + 토크가 켜져 있는지 동시에 확인
 //   ② 토크가 꺼져 있으면 Operating Mode(11) 가 3(위치 제어)인지 확인
-//   ③ Goal Position 을 먼저 써 둔다 (토크를 켜는 순간 이 위치로 가기 때문)
+//   ③ Torque Enable = 1
+//   ④ Goal Position 쓰기 (반드시 토크를 켠 "뒤"에 쓴다)
 //        - 평소: 중립(0 rad → DXL_Sn_ZERO, 기본 2048)
 //        - 최근 100 ms 안에 보낸 명령이 있으면(=비행 중 서보가 리셋된 경우) 그 위치
-//   ④ Torque Enable = 1
-//   ⑤ 다시 읽어서 1 인지 확인 → Ready
+//   ⑤ 토크 = 1, Goal Position = ④ 의 값 인지 다시 읽어 확인 → Ready
+//        확인에 실패하면 토크를 다시 꺼서, 다음 점검 때 ③부터 처음부터 다시 한다.
+//
+// 순서 주의 (2026-11 XL330 벤치 시험에서 확인):
+//   토크가 꺼진 상태에서 Goal Position 을 먼저 써 두고 토크를 켜면, 서보는 그 값으로 가지 않고
+//   "토크를 켠 순간의 현재 위치"를 그대로 붙잡았다 (Goal=2048 써 둠 → 토크 ON → 2828 에서 정지).
+//   토크를 켜는 순간 서보가 목표 위치를 현재 위치로 바꾸는 것으로 보인다.
+//   라떼판다 dynamixel_fix 도 "토크 ON → 목표 위치" 순서였다.
 //
 // 이 함수는 run() 태스크에서만 호출된다 (UART fd 소유 태스크).
 
@@ -167,6 +174,7 @@ void Dynamixel::checkServoHealth(unsigned servo_index, hrt_abstime now)
 		}
 
 		if (_health_fail_count[servo_index] >= HEALTH_FAIL_LIMIT) {
+			setConnected(id, false);
 			setServoHealth(servo_index, ServoHealth::NoResponse);
 		}
 
@@ -174,6 +182,7 @@ void Dynamixel::checkServoHealth(unsigned servo_index, hrt_abstime now)
 	}
 
 	_health_fail_count[servo_index] = 0;
+	setConnected(id, true);   // status 의 connected= 표시도 실제 응답 기준으로 맞춘다
 
 	if (torque == 1) {
 		setServoHealth(servo_index, ServoHealth::Ready);
@@ -199,7 +208,7 @@ void Dynamixel::checkServoHealth(unsigned servo_index, hrt_abstime now)
 		return;
 	}
 
-	// ③ 목표 위치를 먼저 써 둔다
+	// 목표 위치 결정
 	uint32_t goal_position = 0;
 	const bool recent_command = _last_goal_time[servo_index] != 0
 				    && now >= _last_goal_time[servo_index]
@@ -212,24 +221,38 @@ void Dynamixel::checkServoHealth(unsigned servo_index, hrt_abstime now)
 		return;
 	}
 
-	if (!writeRegister(id, ADDR_GOAL_POSITION, goal_position, 4)) {
-		return;
-	}
-
-	// ④ 토크 ON
+	// ③ 토크 ON (이 순간 서보는 현재 위치를 붙잡는다)
 	if (!enableTorque(id, true)) {
 		return;
 	}
 
-	// ⑤ 실제로 켜졌는지 확인
-	uint8_t verify = 0;
+	// ④ 토크를 켠 뒤에 목표 위치를 쓴다 → 서보가 중립(또는 마지막 명령)으로 이동
+	bool ok = writeRegister(id, ADDR_GOAL_POSITION, goal_position, 4);
 
-	if (readRegister(id, ADDR_TORQUE_ENABLE, 1, &verify) && verify == 1) {
-		PX4_INFO("servo %u (id=%u): torque ON, holding raw=%" PRIu32 "%s",
-			 servo_index + 1, static_cast<unsigned>(id), goal_position,
-			 recent_command ? " (last command)" : " (neutral)");
-		setServoHealth(servo_index, ServoHealth::Ready);
+	// ⑤ 토크와 목표 위치가 둘 다 의도대로 들어갔는지 다시 읽어 확인
+	uint8_t verify_torque = 0;
+	uint8_t goal_raw[4] {};
+
+	ok = ok && readRegister(id, ADDR_TORQUE_ENABLE, 1, &verify_torque) && verify_torque == 1;
+	ok = ok && readRegister(id, ADDR_GOAL_POSITION, 4, goal_raw);
+
+	const uint32_t verify_goal = static_cast<uint32_t>(goal_raw[0])
+				     | (static_cast<uint32_t>(goal_raw[1]) << 8)
+				     | (static_cast<uint32_t>(goal_raw[2]) << 16)
+				     | (static_cast<uint32_t>(goal_raw[3]) << 24);
+	ok = ok && verify_goal == goal_position;
+
+	if (!ok) {
+		// 토크만 켜지고 목표 위치가 안 들어간 상태로 남으면, 다음 점검에서 "토크=1 → Ready" 로
+		// 통과해 버려 엉뚱한 위치를 붙잡게 된다. 토크를 다시 꺼서 다음 점검 때 처음부터 재시도한다.
+		enableTorque(id, false);
+		return;
 	}
+
+	PX4_INFO("servo %u (id=%u): torque ON, goal raw=%" PRIu32 "%s",
+		 servo_index + 1, static_cast<unsigned>(id), goal_position,
+		 recent_command ? " (last command)" : " (neutral)");
+	setServoHealth(servo_index, ServoHealth::Ready);
 }
 
 void Dynamixel::setServoHealth(unsigned servo_index, ServoHealth health)
