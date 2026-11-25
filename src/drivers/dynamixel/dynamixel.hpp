@@ -62,10 +62,12 @@ public:
 		uint32_t result{0};        // read 결과값
 		uint16_t model_number{0};  // ping 결과
 		uint8_t  firmware{0};      // ping 결과
+		bool     expect_status{true};  // false면 status packet을 기다리지 않음
 	};
 
 	Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode wire_mode,
-		  uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz);
+		  uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz,
+		  uint8_t servos_per_axis, uint8_t secondary_start_id);
 	~Dynamixel() override;
 
 	/** @see ModuleBase */
@@ -95,7 +97,7 @@ public:
 	 * @param value  값 (little-endian으로 전송됨)
 	 * @param len    바이트 길이 (1, 2, 4)
 	 */
-	bool writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len);
+	bool writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len, bool expect_status = true);
 
 	/**
 	 * Dynamixel Protocol 2.0 register read (INST_READ)
@@ -153,23 +155,37 @@ private:
 	uint16_t updateCRC(uint16_t crc_accum, const uint8_t *data, uint16_t data_len);
 	int  txPacket(uint8_t *packet);
 	bool rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t expected_param_len, int timeout_ms);
-	bool writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len);
+	bool writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len, bool expect_status = true);
 	bool readRegisterUnlocked(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out);
 	bool pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmware_version);
 	void setConnected(uint8_t id, bool connected);
 
-	// X-series 공통 control table 주소 (모델 다르면 값 확인 필요)
+	// X-series 공통 control table 주소 (XL330 / XC330 동일)
+	// --- EEPROM : 토크 OFF 상태에서만 쓰기 가능 + Secondary ID로는 쓸 수 없음 ---
+	static constexpr uint16_t ADDR_DRIVE_MODE      = 10;  // bit0: 0=정방향, 1=역방향
+	static constexpr uint16_t ADDR_SECONDARY_ID    = 12;  // 0~252 활성, 253~255 비활성(기본 255)
+	static constexpr uint16_t ADDR_HOMING_OFFSET   = 20;  // 4바이트 부호있음, 영점 보정 [pulse]
+	static constexpr uint16_t ADDR_CURRENT_LIMIT   = 38;  // 2바이트 [mA], 쌍이 싸울 때 안전장치
+	// --- RAM : Secondary ID로 쓰기 가능 ---
 	static constexpr uint16_t ADDR_TORQUE_ENABLE   = 64;
+	static constexpr uint16_t ADDR_STATUS_RETURN   = 68;  // 2=전부응답(기본), 1=READ만 응답
 	static constexpr uint16_t ADDR_GOAL_POSITION   = 116;
+	static constexpr uint16_t ADDR_PRESENT_CURRENT = 126; // 2바이트 부호있음 [mA], 싸움 감지용
 	static constexpr uint16_t ADDR_PRESENT_POSITION = 132;
 
-	static constexpr unsigned MAX_SERVOS = 4;
+	static constexpr unsigned MAX_SERVOS = 4;              // 축(axis) 최대 개수 — 의미 그대로 유지
+	static constexpr unsigned MAX_SERVOS_PER_AXIS = 2;     // 축당 물리 서보 최대 개수
+	static constexpr unsigned MAX_PHYSICAL_SERVOS = MAX_SERVOS * MAX_SERVOS_PER_AXIS;  // = 8
+	// 253~255는 다이나믹셀이 'Secondary ID 비활성'으로 쓰는 값이다.
+	// 드라이버도 같은 규약: 이 값 이상이면 '쌍의 대표 기본 ID를 쓰기 주소로 쓴다'(방식 2)
+	static constexpr uint8_t SECONDARY_ID_DISABLED = 253;
 	static constexpr size_t PORT_NAME_MAX = 32;
 	static constexpr uint32_t DXL_POS_MIN = DynamixelPositionMapping::PositionMinimum;
 	static constexpr uint32_t DXL_POS_MAX = DynamixelPositionMapping::PositionMaximum;
 	static constexpr hrt_abstime COMMAND_TIMEOUT_US = 100000;
 
-	bool enableTorque(uint8_t id, bool enable);
+	bool enableTorque(uint8_t id, bool enable, bool expect_status = true);
+	bool isSecondaryWriteId(uint8_t id) const;   // 응답이 오지 않는 쓰기 ID인지 판정
 	bool angleToPosition(unsigned servo_index, float angle_rad, uint32_t &position) const;
 	float positionToAngle(unsigned servo_index, uint32_t position) const;
 	void updateCalibration();
@@ -188,8 +204,17 @@ private:
 
 	RunMode _run_mode{RunMode::Bench};
 	WireMode _wire_mode{WireMode::SingleWireOpenDrain};
+	// ---- 축 ↔ 물리 서보 ID 테이블 ----
+	//  _servo_ids[i]   : 축 i의 "읽기" ID = 그 쌍의 대표(기본 ID) 1개
+	//  _write_ids[i]   : 축 i의 "쓰기" ID = Secondary ID(방식1) 또는 대표 기본 ID(방식2)
+	//  _physical_ids[] : 버스에 달린 모든 서보의 기본 ID (ping / EEPROM 설정용)
 	uint8_t _servo_ids[MAX_SERVOS] {1, 2, 3, 4};
-	uint8_t _active_servo_count{1};
+	uint8_t _write_ids[MAX_SERVOS] {1, 2, 3, 4};
+	uint8_t _physical_ids[MAX_PHYSICAL_SERVOS] {1, 2, 3, 4, 5, 6, 7, 8};
+	uint8_t _physical_servo_count{1};
+	uint8_t _servos_per_axis{1};         // 1 = 기존 동작, 2 = 쌍 모드
+	uint8_t _secondary_start_id{255};    // >=253 이면 Secondary 미사용(방식 2)
+	uint8_t _active_servo_count{1};      // = 축 개수
 	hrt_abstime _feedback_interval_us{50000};
 	hrt_abstime _next_feedback_time{0};
 

@@ -60,7 +60,8 @@ private:
 } // namespace
 
 Dynamixel::Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode wire_mode,
-		     uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz) :
+		     uint8_t first_servo_id, uint8_t active_servo_count, unsigned feedback_rate_hz,
+		     uint8_t servos_per_axis, uint8_t secondary_start_id) :
 	ModuleParams(nullptr),
 	_baudrate(baudrate),
 	_run_mode(run_mode),
@@ -69,8 +70,29 @@ Dynamixel::Dynamixel(const char *port, int baudrate, RunMode run_mode, WireMode 
 {
 	strncpy(_port, port, sizeof(_port) - 1);
 
+	// ---- 축 ↔ 물리 서보 ID 테이블 구성 ----
+	//  p=1         : 기존과 동일. 축 i = 서보 (first + i), 쓰기=읽기=같은 ID
+	//  p=2, s<253  : [방식 1] 쓰기 = Secondary ID (s + i)  → 응답 없음
+	//                         읽기 = 대표 (first + 2i)      → 응답 있음
+	//  p=2, s>=253 : [방식 2] 쓰기 = 읽기 = 대표 (first + 2i) → 대표가 응답함
+	//                         (짝의 Secondary ID를 대표와 같은 값으로 미리 설정해 둘 것)
+	_servos_per_axis = (servos_per_axis == 2) ? 2 : 1;
+	_secondary_start_id = secondary_start_id;
+	_physical_servo_count = static_cast<uint8_t>(_active_servo_count * _servos_per_axis);
+
+	const bool use_secondary = (_servos_per_axis == 2)
+				   && (_secondary_start_id < SECONDARY_ID_DISABLED);
+
 	for (unsigned i = 0; i < MAX_SERVOS; ++i) {
-		_servo_ids[i] = first_servo_id + i;
+		const uint8_t primary = static_cast<uint8_t>(first_servo_id + i * _servos_per_axis);
+		_servo_ids[i] = primary;                                       // 읽기 = 쌍의 대표
+		_write_ids[i] = use_secondary
+				? static_cast<uint8_t>(_secondary_start_id + i)  // 방식 1
+				: primary;                                       // 방식 2 / 단일
+	}
+
+	for (unsigned k = 0; k < MAX_PHYSICAL_SERVOS; ++k) {
+		_physical_ids[k] = static_cast<uint8_t>(first_servo_id + k);
 	}
 
 	if (feedback_rate_hz > 0) {
@@ -113,9 +135,9 @@ bool Dynamixel::init()
 	return true;
 }
 
-bool Dynamixel::enableTorque(uint8_t id, bool enable)
+bool Dynamixel::enableTorque(uint8_t id, bool enable, bool expect_status)
 {
-	return writeRegister(id, ADDR_TORQUE_ENABLE, enable ? 1 : 0, 1);
+	return writeRegister(id, ADDR_TORQUE_ENABLE, enable ? 1 : 0, 1, expect_status);
 }
 
 
@@ -609,7 +631,7 @@ bool Dynamixel::rxStatusPacket(uint8_t expected_id, uint8_t *param_out, uint8_t 
 	return false;
 }
 
-bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
+bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t len, bool expect_status)
 {
 	if (!_mutex_initialized) {
 		return false;
@@ -621,11 +643,11 @@ bool Dynamixel::writeRegister(uint8_t id, uint16_t addr, uint32_t value, uint8_t
 		return false;
 	}
 
-	return writeRegisterUnlocked(id, addr, value, len);
+	return writeRegisterUnlocked(id, addr, value, len, expect_status);
 }
 
 
-bool Dynamixel::writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len)
+bool Dynamixel::writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value, uint8_t len, bool expect_status)
 {
 	if (_uart_fd < 0 || (id > 252 && id != DXL_BROADCAST_ID)
 	    || (len != 1 && len != 2 && len != 4)) {
@@ -656,8 +678,16 @@ bool Dynamixel::writeRegisterUnlocked(uint8_t id, uint16_t addr, uint32_t value,
 		return false;
 	}
 
-	return id == DXL_BROADCAST_ID
-	       || rxStatusPacket(id, nullptr, 0, TRANSACTION_TIMEOUT_MS);
+	// broadcast(0xFE)와 Secondary ID 쓰기는 status packet이 오지 않는다.
+	//   - broadcast : 전부 대답하면 버스가 깨지므로 프로토콜이 금지
+	//   - Secondary : e-manual 명시 — "Status Packet will not be returned"
+	// 여기서 기다리면 쓰기 한 번마다 TRANSACTION_TIMEOUT_MS(20ms)를 통째로 버리고
+	// 결과까지 FAIL로 나온다.
+	if (id == DXL_BROADCAST_ID || !expect_status) {
+		return true;
+	}
+
+	return rxStatusPacket(id, nullptr, 0, TRANSACTION_TIMEOUT_MS);
 }
 
 bool Dynamixel::readRegister(uint8_t id, uint16_t addr, uint8_t len, uint8_t *data_out)
@@ -771,15 +801,34 @@ bool Dynamixel::pingUnlocked(uint8_t id, uint16_t *model_number, uint8_t *firmwa
 	return true;
 }
 
+// 이 ID로 보낸 명령에 응답이 오지 않는지 판정.
+// 방식 1(Secondary ID 별도)에서만 true. 방식 2는 대표가 응답하므로 false.
+bool Dynamixel::isSecondaryWriteId(uint8_t id) const
+{
+	if (_servos_per_axis < 2 || _secondary_start_id >= SECONDARY_ID_DISABLED) {
+		return false;
+	}
+
+	for (unsigned i = 0; i < _active_servo_count; ++i) {
+		if (_write_ids[i] == id) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// ping 결과를 비트마스크에 기록. 쌍 모드에서는 물리 서보 8개를 각각 추적한다.
+// (_connected_mask가 uint8_t라 정확히 8비트 = 물리 서보 최대 개수와 맞는다)
 void Dynamixel::setConnected(uint8_t id, bool connected)
 {
-	for (unsigned i = 0; i < _active_servo_count; ++i) {
-		if (_servo_ids[i] == id) {
+	for (unsigned k = 0; k < _physical_servo_count && k < MAX_PHYSICAL_SERVOS; ++k) {
+		if (_physical_ids[k] == id) {
 			if (connected) {
-				_connected_mask |= 1u << i;
+				_connected_mask |= 1u << k;
 
 			} else {
-				_connected_mask &= ~(1u << i);
+				_connected_mask &= ~(1u << k);
 			}
 
 			break;
@@ -819,10 +868,12 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 	int first_servo_id = 1;
 	int active_servo_count = 1;
 	int feedback_rate_hz = 20;
+	int servos_per_axis = 1;        // 1 = 기존 동작(기본값)
+	int secondary_start_id = 101;   // >=253 이면 Secondary 미사용(방식 2)
 	RunMode run_mode = RunMode::Bench;
 	WireMode wire_mode = WireMode::SingleWireOpenDrain;
 
-	while ((ch = px4_getopt(argc, argv, "d:b:m:w:i:n:f:", &myoptind, &myoptarg)) != EOF) {
+	while ((ch = px4_getopt(argc, argv, "d:b:m:w:i:n:f:p:s:", &myoptind, &myoptarg)) != EOF) {
 		switch (ch) {
 		case 'd':
 			device_name = myoptarg;
@@ -907,6 +958,31 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 				break;
 			}
 
+		case 'p': {
+				uint32_t parsed = 0;
+
+				if (!parseUnsignedArgument(myoptarg, 1, MAX_SERVOS_PER_AXIS, parsed)) {
+					print_usage("servos per axis must be 1 or 2");
+					return nullptr;
+				}
+
+				servos_per_axis = static_cast<int>(parsed);
+				break;
+			}
+
+		case 's': {
+				uint32_t parsed = 0;
+
+				// 다이나믹셀 규약 그대로: 0~252 활성, 253~255 비활성
+				if (!parseUnsignedArgument(myoptarg, 0, 255, parsed)) {
+					print_usage("secondary start ID must be in [0, 255] (>=253 = unused)");
+					return nullptr;
+				}
+
+				secondary_start_id = static_cast<int>(parsed);
+				break;
+			}
+
 		default:
 			print_usage("unrecognized flag");
 			return nullptr;
@@ -923,15 +999,39 @@ Dynamixel *Dynamixel::instantiate(int argc, char *argv[])
 		return nullptr;
 	}
 
-	if (first_servo_id + active_servo_count - 1 > 252) {
-		print_usage("active servo ID range must end at or below 252");
+	// 물리 서보 개수 = 축 개수 × 축당 서보 수
+	const int physical_count = active_servo_count * servos_per_axis;
+
+	if (first_servo_id + physical_count - 1 > 252) {
+		print_usage("physical servo ID range must end at or below 252");
 		return nullptr;
+	}
+
+	// 방식 1(Secondary ID 별도)일 때만 범위/겹침 검사
+	if (servos_per_axis > 1 && secondary_start_id < static_cast<int>(SECONDARY_ID_DISABLED)) {
+		if (secondary_start_id + active_servo_count - 1 > 252) {
+			print_usage("secondary ID range must end at or below 252");
+			return nullptr;
+		}
+
+		// Secondary ID 구간이 기본 ID 구간과 겹치면
+		// 어느 서보가 응답하는지 알 수 없게 된다.
+		const bool overlap = (secondary_start_id <= first_servo_id + physical_count - 1)
+				     && (first_servo_id <= secondary_start_id + active_servo_count - 1);
+
+		if (overlap) {
+			print_usage("secondary ID range must not overlap the primary ID range "
+				    "(use -s 255 for the shared-primary scheme)");
+			return nullptr;
+		}
 	}
 
 	Dynamixel *instance = new Dynamixel(device_name, baudrate, run_mode, wire_mode,
 					    static_cast<uint8_t>(first_servo_id),
 					    static_cast<uint8_t>(active_servo_count),
-					    static_cast<unsigned>(feedback_rate_hz));
+					    static_cast<unsigned>(feedback_rate_hz),
+					    static_cast<uint8_t>(servos_per_axis),
+					    static_cast<uint8_t>(secondary_start_id));
 
 	if (instance == nullptr) {
 		PX4_ERR("alloc failed");
@@ -988,11 +1088,11 @@ void Dynamixel::servicePendingCommand()
 		}
 
 	case CmdType::Write:
-		job.success = writeRegister(job.id, job.addr, job.value, job.len);
+		job.success = writeRegister(job.id, job.addr, job.value, job.len, job.expect_status);
 		break;
 
 	case CmdType::Torque:
-		job.success = enableTorque(job.id, job.value != 0);
+		job.success = enableTorque(job.id, job.value != 0, job.expect_status);
 		break;
 
 	default:
@@ -1108,7 +1208,10 @@ void Dynamixel::run()
 				uint32_t position = 0;
 
 				if (angleToPosition(i, angle, position)) {
-					writeRegister(_servo_ids[i], ADDR_GOAL_POSITION, position, 4);
+					// 쓰기는 _write_ids[]. 방식 1이면 Secondary ID(응답 없음),
+					// 방식 2 / 단일이면 대표 기본 ID(응답 있음).
+					writeRegister(_write_ids[i], ADDR_GOAL_POSITION, position, 4,
+						      !isSecondaryWriteId(_write_ids[i]));
 				}
 			}
 		}
@@ -1180,12 +1283,28 @@ int Dynamixel::print_status()
 		 _tx_packet_count, _rx_status_count, _timeout_count,
 		 _rx_crc_error_count, _rx_device_error_count);
 
+	const char *pair_scheme = (_servos_per_axis < 2) ? "single"
+				  : (_secondary_start_id < SECONDARY_ID_DISABLED)
+				  ? "pair/secondary" : "pair/shared-primary";
+
+	PX4_INFO("pairing: %s, %u servo(s)/axis, secondary base=%u, physical servos=%u",
+		 pair_scheme,
+		 static_cast<unsigned>(_servos_per_axis),
+		 static_cast<unsigned>(_secondary_start_id),
+		 static_cast<unsigned>(_physical_servo_count));
+
 	for (unsigned i = 0; i < _active_servo_count; ++i) {
-		PX4_INFO("servo %u id=%u connected=%s zero=%" PRId32 " dir=%" PRId32
+		PX4_INFO("axis %u write_id=%u read_id=%u zero=%" PRId32 " dir=%" PRId32
 			 " min=%" PRId32 " max=%" PRId32,
-			 i + 1, static_cast<unsigned>(_servo_ids[i]),
-			 (_connected_mask & (1u << i)) ? "yes" : "no",
+			 i + 1, static_cast<unsigned>(_write_ids[i]),
+			 static_cast<unsigned>(_servo_ids[i]),
 			 _zero_raw[i], _direction[i], _min_raw[i], _max_raw[i]);
+	}
+
+	for (unsigned k = 0; k < _physical_servo_count && k < MAX_PHYSICAL_SERVOS; ++k) {
+		PX4_INFO("  physical id=%u connected=%s",
+			 static_cast<unsigned>(_physical_ids[k]),
+			 (_connected_mask & (1u << k)) ? "yes" : "no");
 	}
 
 	return 0;
@@ -1242,6 +1361,17 @@ int Dynamixel::custom_command(int argc, char *argv[])
   		cmd.addr = address;
   		cmd.value = value;
   		cmd.len = length;
+		// Secondary ID로 쓰면 응답이 안 오므로 자동으로 기다리지 않게 한다
+		cmd.expect_status = !instance->isSecondaryWriteId(id);
+
+		// EEPROM 영역은 Secondary ID로 쓸 수 없다 (서보가 조용히 무시한다).
+		// 응답도 없어서 성공처럼 보이므로 여기서 미리 막는다.
+		if (!cmd.expect_status && address < 64) {
+			PX4_WARN("addr=%u는 EEPROM이라 Secondary ID로 쓸 수 없다 - 개별 기본 ID를 쓸 것",
+				 static_cast<unsigned>(address));
+			return 1;
+		}
+
   		const bool ok = submitCommand(cmd);
 
 		PX4_INFO("write id=%u addr=%u value=%" PRIu32 " len=%u -> %s",
@@ -1339,10 +1469,63 @@ int Dynamixel::custom_command(int argc, char *argv[])
 		cmd.type = CmdType::Torque;
 		cmd.id = id;
   		cmd.value = enable_value;
+		cmd.expect_status = !instance->isSecondaryWriteId(id);
   		const bool ok = submitCommand(cmd);
 		PX4_INFO("torque id=%u value=%u -> %s", static_cast<unsigned>(id),
 			 static_cast<unsigned>(enable_value), ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;
+	}
+
+	// [추가] 쌍 전류 점검: 같은 축의 두 서보가 서로 밀고 있지 않은지 확인.
+	//   정상이면 두 값의 부호가 같거나 둘 다 0 근처다.
+	//   부호가 반대로 크게 나오면 영점(Homing Offset)이 어긋나 서로 싸우는 중이다.
+	if (strcmp(argv[0], "paircheck") == 0) {
+		if (argc != 2) {
+			return print_usage("paircheck requires: <axis 1..4>");
+		}
+
+		if (instance->_servos_per_axis < 2) {
+			PX4_ERR("paircheck는 쌍 모드(-p 2)에서만 의미가 있다");
+			return 1;
+		}
+
+		uint32_t axis = 0;
+
+		if (!parseUnsignedArgument(argv[1], 1, instance->_active_servo_count, axis)) {
+			return print_usage("paircheck axis is out of range");
+		}
+
+		const unsigned index = static_cast<unsigned>(axis - 1u);
+		const uint8_t id_a = instance->_servo_ids[index];       // 쌍의 대표
+		const uint8_t id_b = static_cast<uint8_t>(id_a + 1);    // 그 짝
+		int32_t current[2] {0, 0};
+
+		for (unsigned k = 0; k < 2; ++k) {
+			PendingCommand cmd {};
+			cmd.type = CmdType::Read;
+			cmd.id = (k == 0) ? id_a : id_b;
+			cmd.addr = ADDR_PRESENT_CURRENT;
+			cmd.len = 2;
+
+			if (!submitCommand(cmd)) {
+				PX4_ERR("paircheck: id=%u 전류 읽기 실패", static_cast<unsigned>(cmd.id));
+				return 1;
+			}
+
+			// Present Current는 부호 있는 16비트 → 음수로 복원
+			current[k] = static_cast<int16_t>(static_cast<uint16_t>(cmd.result));
+		}
+
+		PX4_INFO("axis %u: id=%u current=%" PRId32 " mA  /  id=%u current=%" PRId32 " mA",
+			 static_cast<unsigned>(axis),
+			 static_cast<unsigned>(id_a), current[0],
+			 static_cast<unsigned>(id_b), current[1]);
+
+		if ((current[0] > 0 && current[1] < 0) || (current[0] < 0 && current[1] > 0)) {
+			PX4_WARN("부호 반대 - 두 서보가 서로 밀고 있다. Homing Offset(주소 20) 재조정 필요");
+		}
+
+		return 0;
 	}
 
 	if (strcmp(argv[0], "map") == 0) {
@@ -1412,6 +1595,9 @@ Wire modes:
 
 ### Examples
 $ dynamixel start -d /dev/ttyS1 -b 57600 -m bench -w single -i 1 -n 1
+$ dynamixel start -d /dev/ttyS1 -b 57600 -m bench -w single -i 1  -n 1 -p 2 -s 101
+$ dynamixel start -d /dev/ttyS1 -b 57600 -m bench -w single -i 11 -n 1 -p 2 -s 255
+$ dynamixel paircheck 1
 $ dynamixel ping 1
 $ dynamixel read 1 0 2
 $ dynamixel read 1 132 4
@@ -1428,13 +1614,16 @@ $ dynamixel status
 	PRINT_MODULE_USAGE_PARAM_STRING('m', "bench", "<bench|auto>", "Run mode", true);
 	PRINT_MODULE_USAGE_PARAM_STRING('w', "single", "<single|single-pushpull|uart>", "Electrical UART mode", true);
 	PRINT_MODULE_USAGE_PARAM_INT('i', 1, 0, 252, "First servo ID", true);
-	PRINT_MODULE_USAGE_PARAM_INT('n', 1, 1, 4, "Number of consecutive servo IDs", true);
+	PRINT_MODULE_USAGE_PARAM_INT('n', 1, 1, 4, "Number of axes", true);
 	PRINT_MODULE_USAGE_PARAM_INT('f', 20, 1, 100, "Feedback rate in auto mode", true);
+	PRINT_MODULE_USAGE_PARAM_INT('p', 1, 1, 2, "Physical servos per axis (2 = paired)", true);
+	PRINT_MODULE_USAGE_PARAM_INT('s', 101, 0, 255, "Secondary ID of axis 1 (>=253 = shared-primary)", true);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("ping", "ping <id>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("write", "write <id> <addr> <value> <len>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("read", "read <id> <addr> <len>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("torque", "torque <id> <0|1>");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("map", "map <channel 1..4> <angle_rad>");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("paircheck", "paircheck <axis 1..4> (쌍 전류 비교)");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 
 	return 0;
